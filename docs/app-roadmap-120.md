@@ -33,7 +33,12 @@
 ## Batch 2 · 首页、工具箱与可视化协作
 
 2026-09-16：Homer `v26.08.3`、IT-Tools `v2024.10.22-7ca5933`、CyberChef `v11.4.0`
-和 draw.io `v31.4.5` 已完成本地完整验证，正在走正式发布门禁。
+和 draw.io `v31.4.5` 已通过本地与 CI 完整验证并发布至公开数据源（4/10）。
+验证任务：[Homer](https://github.com/CoreNovaLabs/CoreNovaLaunchVerify/actions/runs/35062601771)、
+[IT-Tools](https://github.com/CoreNovaLabs/CoreNovaLaunchVerify/actions/runs/35062605378)、
+[CyberChef](https://github.com/CoreNovaLabs/CoreNovaLaunchVerify/actions/runs/35062608111)、
+[draw.io](https://github.com/CoreNovaLabs/CoreNovaLaunchVerify/actions/runs/35062611179)。
+四项 `verify` job 均成功；中间两项官网通知被并发队列替换，末次通知和官网构建已成功。
 本批按实际部署条件拆分，剩余 6 项保留候选资格：
 
 - Homepage：部署域名需要映射至 `HOMEPAGE_ALLOWED_HOSTS`；现有 URL 注入传入完整 URL，
