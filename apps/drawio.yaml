@@ -1,0 +1,65 @@
+app:
+  name: drawio
+  category: productivity
+  app_type: stateless_web
+  icon: /icons/drawio.svg
+  i18n:
+    en:
+      display_name: draw.io
+      description: Create flowcharts and architecture diagrams with a browser editor
+    zh:
+      display_name: draw.io 流程图
+      description: 通过浏览器编辑流程图、架构图和其他专业图表
+source:
+  repo: jgraph/drawio
+  version_strategy: release_tag
+  release_filter:
+    prerelease: false
+    draft: false
+deploy:
+  docker_image: jgraph/drawio
+  image_tag_template: jgraph/drawio:{version_no_v}
+  container_port: 8080
+  compose_file: apps/drawio/docker-compose.yml
+health_check:
+  endpoint: /
+  expected_status: 200
+  timeout_seconds: 5
+  retries: 40
+  interval_seconds: 3
+  startup_timeout_seconds: 180
+  version_assertion:
+    kind: exec_command
+    command: grep -oE 'EditorUi.VERSION="[0-9.]+"' /usr/local/tomcat/webapps/draw/js/app.min.js | head
+      -1 | cut -d'"' -f2
+    expected: '{version_no_v}'
+    match: exact
+tests:
+  predefined_dir: apps/drawio/tests
+  scenarios:
+  - slug: home
+    url: /?offline=1&https=0
+    caption:
+      en: draw.io
+      zh: draw.io 流程图
+deployment:
+  size: small
+  documentation_url: https://github.com/jgraph/docker-drawio
+  regions:
+  - us-east-1
+  post_deploy:
+    notes:
+    - en: Open /?offline=1&https=0 to work with local files. Save diagrams to your device; cloud storage
+        integrations and a separate export service are not configured.
+      zh: 打开 /?offline=1&https=0 使用本地文件模式。请将图表保存到自己的设备；未配置云存储集成和独立导出服务。
+website:
+  featured: false
+  screenshots_order:
+  - home
+  tags:
+  - diagrams
+  - flowcharts
+  - whiteboard
+  features:
+  - en: Create flowcharts and architecture diagrams with a browser editor
+    zh: 通过浏览器编辑流程图、架构图和其他专业图表

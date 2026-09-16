@@ -1,0 +1,6 @@
+services:
+  drawio:
+    image: ${CORENOVA_APP_IMAGE}
+    restart: "no"
+    ports:
+      - "${CORENOVA_HOST_PORT}:${CORENOVA_CONTAINER_PORT}"

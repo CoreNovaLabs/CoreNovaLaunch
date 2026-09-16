@@ -1,0 +1,66 @@
+# 静态构建在 JavaScript bundle 的 PACKAGE_VERSION 中包含精确发行版。
+app:
+  name: it-tools
+  category: productivity
+  app_type: stateless_web
+  icon: /icons/it-tools.svg
+  i18n:
+    en:
+      display_name: IT-Tools
+      description: Browser-based encoding, conversion and calculation tools for developers
+    zh:
+      display_name: IT-Tools 开发工具箱
+      description: 在浏览器中使用编码、格式转换和计算等开发者工具
+source:
+  repo: CorentinTh/it-tools
+  version_strategy: release_tag
+  release_filter:
+    prerelease: false
+    draft: false
+deploy:
+  docker_image: corentinth/it-tools
+  image_tag_template: corentinth/it-tools:{version_no_v}
+  container_port: 80
+  compose_file: apps/it-tools/docker-compose.yml
+health_check:
+  endpoint: /
+  expected_status: 200
+  timeout_seconds: 5
+  retries: 40
+  interval_seconds: 3
+  startup_timeout_seconds: 180
+  version_assertion:
+    kind: exec_command
+    command: >-
+      grep -ohE 'PACKAGE_VERSION:"[^"]+"' /usr/share/nginx/html/assets/index-*.js | head -1 | cut -d'"' -f2
+    expected: '{version_no_v}'
+    match: exact
+tests:
+  predefined_dir: apps/it-tools/tests
+  scenarios:
+  - slug: home
+    url: /
+    caption:
+      en: IT-Tools
+      zh: IT-Tools 开发工具箱
+deployment:
+  size: small
+  documentation_url: https://github.com/CorentinTh/it-tools
+  regions:
+  - us-east-1
+  post_deploy:
+    notes:
+    - en: Tools run in the browser. This deployment has no server-side document storage; retain important
+        inputs and results yourself.
+      zh: 工具在浏览器中运行；此部署不提供服务端文档存储，请自行保存重要输入和结果。
+website:
+  featured: false
+  screenshots_order:
+  - home
+  tags:
+  - developer-tools
+  - conversion
+  - utilities
+  features:
+  - en: Browser-based encoding, conversion and calculation tools for developers
+    zh: 在浏览器中使用编码、格式转换和计算等开发者工具

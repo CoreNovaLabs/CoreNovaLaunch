@@ -1,0 +1,65 @@
+app:
+  name: homer
+  category: productivity
+  app_type: stateful_app
+  icon: /icons/homer.svg
+  i18n:
+    en:
+      display_name: Homer
+      description: A lightweight, configurable homepage for self-hosted services
+    zh:
+      display_name: Homer 服务导航
+      description: 为自托管服务提供轻量、可配置的导航首页
+source:
+  repo: bastienwirtz/homer
+  version_strategy: release_tag
+  release_filter:
+    prerelease: false
+    draft: false
+deploy:
+  docker_image: ghcr.io/bastienwirtz/homer
+  image_tag_template: ghcr.io/bastienwirtz/homer:{version}
+  container_port: 8080
+  compose_file: apps/homer/docker-compose.yml
+health_check:
+  endpoint: /
+  expected_status: 200
+  timeout_seconds: 5
+  retries: 40
+  interval_seconds: 3
+  startup_timeout_seconds: 180
+  version_assertion:
+    kind: exec_command
+    command: cat /www/VERSION
+    expected: '{version_no_v}'
+    match: exact
+tests:
+  predefined_dir: apps/homer/tests
+  scenarios:
+  - slug: home
+    url: /
+    caption:
+      en: Homer
+      zh: Homer 服务导航
+deployment:
+  size: small
+  documentation_url: https://github.com/bastienwirtz/homer
+  regions:
+  - us-east-1
+  data_path: /www/assets
+  post_deploy:
+    notes:
+    - en: Edit /www/assets/config.yml through the instance terminal to organize links. The public dashboard
+        has no built-in sign-in; do not place private information in its configuration.
+      zh: 通过实例终端编辑 /www/assets/config.yml 来组织链接。导航页公开可见，没有内置登录功能，请勿在配置中放入私密信息。
+website:
+  featured: false
+  screenshots_order:
+  - home
+  tags:
+  - dashboard
+  - bookmarks
+  - homepage
+  features:
+  - en: A lightweight, configurable homepage for self-hosted services
+    zh: 为自托管服务提供轻量、可配置的导航首页

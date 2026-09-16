@@ -1,0 +1,64 @@
+app:
+  name: cyberchef
+  category: productivity
+  app_type: stateless_web
+  icon: /icons/cyberchef.svg
+  i18n:
+    en:
+      display_name: CyberChef
+      description: Compose browser-based recipes for encoding, decoding and data analysis
+    zh:
+      display_name: CyberChef 数据处理
+      description: 组合浏览器处理步骤，完成数据编码、解码和分析
+source:
+  repo: gchq/CyberChef
+  version_strategy: release_tag
+  release_filter:
+    prerelease: false
+    draft: false
+deploy:
+  docker_image: ghcr.io/gchq/cyberchef
+  image_tag_template: ghcr.io/gchq/cyberchef:{version_no_v}
+  container_port: 8080
+  compose_file: apps/cyberchef/docker-compose.yml
+health_check:
+  endpoint: /
+  expected_status: 200
+  timeout_seconds: 5
+  retries: 40
+  interval_seconds: 3
+  startup_timeout_seconds: 180
+  version_assertion:
+    kind: exec_command
+    command: ls /usr/share/nginx/html/CyberChef_v*.zip | sed -E 's/.*CyberChef_v([0-9.]+)\.zip/\1/'
+    expected: '{version_no_v}'
+    match: exact
+tests:
+  predefined_dir: apps/cyberchef/tests
+  scenarios:
+  - slug: home
+    url: /
+    caption:
+      en: CyberChef
+      zh: CyberChef 数据处理
+deployment:
+  size: small
+  documentation_url: https://github.com/gchq/CyberChef/wiki
+  regions:
+  - us-east-1
+  post_deploy:
+    notes:
+    - en: Save recipes and output files to your device. Processing runs in the browser and this deployment
+        has no server-side workspace storage.
+      zh: 请将配方和输出文件保存到自己的设备。处理在浏览器中执行，此部署不提供服务端工作区存储。
+website:
+  featured: false
+  screenshots_order:
+  - home
+  tags:
+  - data-analysis
+  - encoding
+  - recipes
+  features:
+  - en: Compose browser-based recipes for encoding, decoding and data analysis
+    zh: 组合浏览器处理步骤，完成数据编码、解码和分析
