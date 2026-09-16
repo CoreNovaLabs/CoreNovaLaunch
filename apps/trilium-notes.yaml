@@ -1,0 +1,84 @@
+# CoreNova Launch · 应用注册（App Schema 唯一事实源）
+# 契约：contracts/app-schema.md（校验规则见 §5，共 19 条）
+# 实测 triliumnext/trilium:v0.105.0 (linux/amd64)：/api/health-check 返回
+# {"status":"ok"}，OCI version label 为 v0.105.0，数据目录为 /home/node/trilium-data。
+
+app:
+  name: "trilium-notes"
+  category: "productivity"
+  app_type: "stateful_app"
+  icon: "/icons/trilium-notes.svg"   # Repo A 静态资产，需人工预置（缺失时官网回退字母头像）
+  i18n:
+    en:
+      display_name: "Trilium Notes"
+      description: "Hierarchical note-taking application for large personal knowledge bases"
+    zh:
+      display_name: "Trilium Notes 知识库"
+      description: "面向大型个人知识库的层级化笔记应用"
+
+source:
+  repo: "TriliumNext/Trilium"
+  version_strategy: "release_tag"
+  release_filter:
+    prerelease: false
+    draft: false
+
+deploy:
+  docker_image: "triliumnext/trilium"
+  image_tag_template: "triliumnext/trilium:{version}"
+  container_port: 8080
+  compose_file: "apps/trilium-notes/docker-compose.yml"
+  # extra_environment: []   # 可选：one-click 模板注入的 KEY=VALUE；含敏感词会被拒绝（规则16）
+
+health_check:
+  endpoint: "/api/health-check"
+  expected_status: 200
+  method: "GET"
+  timeout_seconds: 5
+  retries: 40
+  interval_seconds: 3
+  startup_timeout_seconds: 180
+  version_assertion:
+    kind: "exec_command"
+    command: >-
+      node -e 'const s=require("fs").readFileSync("/usr/src/app/main.cjs","utf8"); console.log(s.match(/name:"@triliumnext\/server",version:"([^"]+)/)[1])'
+    expected: "{version_no_v}"
+    match: "exact"
+
+tests:
+  predefined_dir: "apps/trilium-notes/tests"
+  scenarios:
+    - slug: "setup"
+      url: "/"
+      caption:
+        en: "First-run setup"
+        zh: "首次运行设置"
+
+deployment:
+  size: "small"
+  documentation_url: "https://docs.triliumnotes.org/"
+  regions: ["us-east-1"]  # v1 单区域（规则14）
+  post_deploy:
+    admin_path: "/"
+    admin_setup:
+      en: "First visit opens the initialization screen; create a new protected Trilium document or connect to an existing sync server."
+      zh: "首次访问会打开初始化页；可创建受保护的 Trilium 文档，或连接现有同步服务器。"
+    notes:
+      - en: "Notes, attachments, configuration and backups are retained under /home/node/trilium-data."
+        zh: "笔记、附件、配置和备份均保留在 /home/node/trilium-data。"
+  cost_estimate:
+    monthly_usd: 23
+    note:
+      en: "Verified default in us-east-1: t3.small, 20 GB root plus 30 GB data gp3, and public IPv4; transfer and snapshots are extra."
+      zh: "us-east-1 已验证默认配置：t3.small、20GB 系统盘、30GB 数据盘与公网 IPv4；流量和快照另计。"
+  data_path: "/home/node/trilium-data"
+
+website:
+  featured: false
+  screenshots_order: ["setup"]
+  tags: ["notes", "knowledge-base", "markdown"]
+  features:
+    - en: "Deep note trees, links, attributes and powerful search"
+      zh: "深层笔记树、双向链接、属性与强大搜索"
+    - en: "Built-in sync, scripting and automatic backups"
+      zh: "内置同步、脚本能力与自动备份"

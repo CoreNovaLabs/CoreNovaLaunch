@@ -1,0 +1,84 @@
+# CoreNova Launch · 应用注册（App Schema 唯一事实源）
+# 契约：contracts/app-schema.md（校验规则见 §5，共 19 条）
+# 实测 nodered/node-red:5.0.7 (linux/amd64)：/ 返回 Node-RED 编辑器，
+# /usr/src/node-red/package.json 版本为 5.0.7，流程与设置保存在 /data。
+
+app:
+  name: "node-red"
+  category: "automation"
+  app_type: "stateful_app"
+  icon: "/icons/node-red.svg"   # Repo A 静态资产，需人工预置（缺失时官网回退字母头像）
+  i18n:
+    en:
+      display_name: "Node-RED"
+      description: "Low-code, flow-based programming for event-driven applications"
+    zh:
+      display_name: "Node-RED 流程编排"
+      description: "面向事件驱动应用的低代码可视化流程编程"
+
+source:
+  repo: "node-red/node-red"
+  version_strategy: "release_tag"
+  release_filter:
+    prerelease: false
+    draft: false
+
+deploy:
+  docker_image: "nodered/node-red"
+  image_tag_template: "nodered/node-red:{version}"
+  container_port: 1880
+  compose_file: "apps/node-red/docker-compose.yml"
+  # extra_environment: []   # 可选：one-click 模板注入的 KEY=VALUE；含敏感词会被拒绝（规则16）
+
+health_check:
+  endpoint: "/"
+  expected_status: 200
+  method: "GET"
+  timeout_seconds: 5
+  retries: 40
+  interval_seconds: 3
+  startup_timeout_seconds: 180
+  version_assertion:
+    kind: "exec_command"
+    command: >-
+      node -p 'require("/usr/src/node-red/package.json").version'
+    expected: "{version}"
+    match: "exact"
+
+tests:
+  predefined_dir: "apps/node-red/tests"
+  scenarios:
+    - slug: "editor"
+      url: "/"
+      caption:
+        en: "Flow editor"
+        zh: "流程编辑器"
+
+deployment:
+  size: "small"
+  documentation_url: "https://nodered.org/docs/"
+  regions: ["us-east-1"]  # v1 单区域（规则14）
+  post_deploy:
+    admin_path: "/"
+    admin_setup:
+      en: "The flow editor is available at / after startup. Configure editor access control before exposing production flows."
+      zh: "启动后可在 / 使用流程编辑器；对外提供生产流程前请配置编辑器访问控制。"
+    notes:
+      - en: "Flows, settings, installed nodes and encrypted flow credentials are retained under /data."
+        zh: "流程、设置、已安装节点和加密的流程凭据均保留在 /data。"
+  cost_estimate:
+    monthly_usd: 23
+    note:
+      en: "Verified default in us-east-1: t3.small, 20 GB root plus 30 GB data gp3, and public IPv4; transfer and snapshots are extra."
+      zh: "us-east-1 已验证默认配置：t3.small、20GB 系统盘、30GB 数据盘与公网 IPv4；流量和快照另计。"
+  data_path: "/data"
+
+website:
+  featured: false
+  screenshots_order: ["editor"]
+  tags: ["automation", "iot", "low-code"]
+  features:
+    - en: "Wire APIs, devices and services together with visual flows"
+      zh: "通过可视化流程连接 API、设备与服务"
+    - en: "Large node ecosystem with reusable JavaScript functions"
+      zh: "丰富的节点生态与可复用 JavaScript 函数"

@@ -1,0 +1,83 @@
+# CoreNova Launch · 应用注册（App Schema 唯一事实源）
+# 契约：contracts/app-schema.md（校验规则见 §5，共 19 条）
+# 实测 sissbruecker/linkding:1.47.0 (linux/amd64)：/ 最终跳转到
+# /login/，/etc/linkding/version.txt 精确记录 1.47.0，数据均在 /etc/linkding/data。
+
+app:
+  name: "linkding"
+  category: "productivity"
+  app_type: "stateful_app"
+  icon: "/icons/linkding.svg"   # Repo A 静态资产，需人工预置（缺失时官网回退字母头像）
+  i18n:
+    en:
+      display_name: "Linkding"
+      description: "Fast, minimal bookmark manager with tags and full-text search"
+    zh:
+      display_name: "Linkding 书签管理"
+      description: "支持标签与全文搜索的快速轻量书签管理器"
+
+source:
+  repo: "sissbruecker/linkding"
+  version_strategy: "release_tag"
+  release_filter:
+    prerelease: false
+    draft: false
+
+deploy:
+  docker_image: "sissbruecker/linkding"
+  image_tag_template: "sissbruecker/linkding:{version_no_v}"
+  container_port: 9090
+  compose_file: "apps/linkding/docker-compose.yml"
+  # extra_environment: []   # 可选：one-click 模板注入的 KEY=VALUE；含敏感词会被拒绝（规则16）
+
+health_check:
+  endpoint: "/"
+  expected_status: 200
+  method: "GET"
+  timeout_seconds: 5
+  retries: 40
+  interval_seconds: 3
+  startup_timeout_seconds: 180
+  version_assertion:
+    kind: "exec_command"
+    command: "cat /etc/linkding/version.txt"
+    expected: "{version_no_v}"
+    match: "exact"
+
+tests:
+  predefined_dir: "apps/linkding/tests"
+  scenarios:
+    - slug: "login"
+      url: "/"
+      caption:
+        en: "Sign-in page"
+        zh: "登录页"
+
+deployment:
+  size: "small"
+  documentation_url: "https://linkding.link/"
+  regions: ["us-east-1"]  # v1 单区域（规则14）
+  post_deploy:
+    admin_path: "/admin/"
+    admin_setup:
+      en: "Create the first account through AWS Systems Manager Session Manager with the upstream manage.py createsuperuser command, then sign in at /."
+      zh: "通过 AWS Systems Manager Session Manager 执行上游 manage.py createsuperuser 命令创建首个账户，然后在 / 登录。"
+    notes:
+      - en: "Bookmarks, previews, favicons and the SQLite database are retained under /etc/linkding/data."
+        zh: "书签、预览、站点图标与 SQLite 数据库均保留在 /etc/linkding/data。"
+  cost_estimate:
+    monthly_usd: 23
+    note:
+      en: "Verified default in us-east-1: t3.small, 20 GB root plus 30 GB data gp3, and public IPv4; transfer and snapshots are extra."
+      zh: "us-east-1 已验证默认配置：t3.small、20GB 系统盘、30GB 数据盘与公网 IPv4；流量和快照另计。"
+  data_path: "/etc/linkding/data"
+
+website:
+  featured: false
+  screenshots_order: ["login"]
+  tags: ["bookmarks", "search", "productivity"]
+  features:
+    - en: "Organize bookmarks with tags, notes and bulk actions"
+      zh: "使用标签、备注和批量操作管理书签"
+    - en: "Search archived pages and bookmark metadata"
+      zh: "搜索已归档页面与书签元数据"

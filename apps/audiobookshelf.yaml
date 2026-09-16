@@ -1,0 +1,86 @@
+# CoreNova Launch · 应用注册（App Schema 唯一事实源）
+# 契约：contracts/app-schema.md（校验规则见 §5，共 19 条）
+# 实测 ghcr.io/advplyr/audiobookshelf:2.36.0 (linux/amd64)：/healthcheck
+# 返回 OK，OCI version label 为 2.36.0。配置和元数据收敛到 /data。
+
+app:
+  name: "audiobookshelf"
+  category: "media"
+  app_type: "stateful_app"
+  icon: "/icons/audiobookshelf.svg"   # Repo A 静态资产，需人工预置（缺失时官网回退字母头像）
+  i18n:
+    en:
+      display_name: "Audiobookshelf"
+      description: "Self-hosted audiobook and podcast server with progress sync"
+    zh:
+      display_name: "Audiobookshelf 有声书库"
+      description: "支持进度同步的自托管有声书与播客服务器"
+
+source:
+  repo: "advplyr/audiobookshelf"
+  version_strategy: "release_tag"
+  release_filter:
+    prerelease: false
+    draft: false
+
+deploy:
+  docker_image: "ghcr.io/advplyr/audiobookshelf"
+  image_tag_template: "ghcr.io/advplyr/audiobookshelf:{version_no_v}"
+  container_port: 80
+  compose_file: "apps/audiobookshelf/docker-compose.yml"
+  extra_environment:
+    - "CONFIG_PATH=/data/config"
+    - "METADATA_PATH=/data/metadata"
+
+health_check:
+  endpoint: "/healthcheck"
+  expected_status: 200
+  method: "GET"
+  timeout_seconds: 5
+  retries: 40
+  interval_seconds: 3
+  startup_timeout_seconds: 180
+  version_assertion:
+    kind: "exec_command"
+    command: >-
+      node -p 'require("/app/package.json").version'
+    expected: "{version_no_v}"
+    match: "exact"
+
+tests:
+  predefined_dir: "apps/audiobookshelf/tests"
+  scenarios:
+    - slug: "login"
+      url: "/"
+      caption:
+        en: "Sign-in and setup page"
+        zh: "登录与设置页"
+
+deployment:
+  size: "medium"
+  documentation_url: "https://www.audiobookshelf.org/docs/"
+  regions: ["us-east-1"]  # v1 单区域（规则14）
+  post_deploy:
+    admin_path: "/"
+    admin_setup:
+      en: "Open / and create the root user, then add audiobook and podcast libraries under /data."
+      zh: "打开 / 创建根用户，然后添加位于 /data 下的有声书和播客媒体库。"
+    notes:
+      - en: "Configuration, metadata and user media share the retained /data root."
+        zh: "配置、元数据与用户媒体共用持久化 /data 根目录。"
+  cost_estimate:
+    monthly_usd: 39
+    note:
+      en: "Verified default in us-east-1: t3.medium, 20 GB root plus 60 GB data gp3, and public IPv4; media storage, transfer and transcoding are extra."
+      zh: "us-east-1 已验证默认配置：t3.medium、20GB 系统盘、60GB 数据盘与公网 IPv4；媒体存储、流量与转码另计。"
+  data_path: "/data"
+
+website:
+  featured: false
+  screenshots_order: ["login"]
+  tags: ["audiobooks", "podcasts", "streaming"]
+  features:
+    - en: "Stream audiobooks and podcasts with per-user progress sync"
+      zh: "串流有声书与播客，按用户同步播放进度"
+    - en: "Metadata matching, chapters, collections and mobile apps"
+      zh: "支持元数据匹配、章节、合集与移动客户端"

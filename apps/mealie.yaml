@@ -1,0 +1,84 @@
+# CoreNova Launch · 应用注册（App Schema 唯一事实源）
+# 契约：contracts/app-schema.md（校验规则见 §5，共 19 条）
+# 实测 ghcr.io/mealie-recipes/mealie:v3.26.0 (linux/amd64)：
+# /api/app/about 免鉴权返回 version=v3.26.0，SQLite 与上传内容均在 /app/data。
+
+app:
+  name: "mealie"
+  category: "productivity"
+  app_type: "stateful_app"
+  icon: "/icons/mealie.svg"   # Repo A 静态资产，需人工预置（缺失时官网回退字母头像）
+  i18n:
+    en:
+      display_name: "Mealie"
+      description: "Self-hosted recipe manager with meal planning and shopping lists"
+    zh:
+      display_name: "Mealie 菜谱管理"
+      description: "支持餐食计划与购物清单的自托管菜谱管理器"
+
+source:
+  repo: "mealie-recipes/mealie"
+  version_strategy: "release_tag"
+  release_filter:
+    prerelease: false
+    draft: false
+
+deploy:
+  docker_image: "ghcr.io/mealie-recipes/mealie"
+  image_tag_template: "ghcr.io/mealie-recipes/mealie:{version}"
+  container_port: 9000
+  compose_file: "apps/mealie/docker-compose.yml"
+  # extra_environment: []   # 可选：one-click 模板注入的 KEY=VALUE；含敏感词会被拒绝（规则16）
+
+health_check:
+  endpoint: "/api/app/about"
+  expected_status: 200
+  method: "GET"
+  timeout_seconds: 5
+  retries: 40
+  interval_seconds: 3
+  startup_timeout_seconds: 180
+  version_assertion:
+    kind: "api_json_path"
+    path: "/api/app/about"
+    json_pointer: "/version"
+    expected: "{version}"
+    match: "exact"
+
+tests:
+  predefined_dir: "apps/mealie/tests"
+  scenarios:
+    - slug: "welcome"
+      url: "/"
+      caption:
+        en: "Welcome page"
+        zh: "欢迎页"
+
+deployment:
+  size: "small"
+  documentation_url: "https://docs.mealie.io/"
+  regions: ["us-east-1"]  # v1 单区域（规则14）
+  post_deploy:
+    admin_path: "/"
+    admin_setup:
+      en: "Open / after deployment and follow the first-run flow to create the owner account."
+      zh: "部署后打开 /，按首次运行引导创建所有者账户。"
+    notes:
+      - en: "Recipes, uploads, backups and the SQLite database are retained under /app/data."
+        zh: "菜谱、上传文件、备份与 SQLite 数据库均保留在 /app/data。"
+  cost_estimate:
+    monthly_usd: 23
+    note:
+      en: "Verified default in us-east-1: t3.small, 20 GB root plus 30 GB data gp3, and public IPv4; transfer and snapshots are extra."
+      zh: "us-east-1 已验证默认配置：t3.small、20GB 系统盘、30GB 数据盘与公网 IPv4；流量和快照另计。"
+  data_path: "/app/data"
+
+website:
+  featured: false
+  screenshots_order: ["welcome"]
+  tags: ["recipes", "meal-planning", "shopping"]
+  features:
+    - en: "Import and organize recipes with searchable metadata"
+      zh: "导入并组织菜谱，支持元数据检索"
+    - en: "Build meal plans and generate shopping lists"
+      zh: "编排餐食计划并生成购物清单"

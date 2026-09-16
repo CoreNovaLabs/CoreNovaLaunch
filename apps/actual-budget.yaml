@@ -1,0 +1,84 @@
+# CoreNova Launch · 应用注册（App Schema 唯一事实源）
+# 契约：contracts/app-schema.md（校验规则见 §5，共 19 条）
+# 实测 ghcr.io/actualbudget/actual:26.9.0 (linux/amd64)：/health 返回 UP，
+# /info 的 build.version 为 26.9.0，账户和预算文件保存在 /data。
+
+app:
+  name: "actual-budget"
+  category: "productivity"
+  app_type: "stateful_app"
+  icon: "/icons/actual-budget.svg"   # Repo A 静态资产，需人工预置（缺失时官网回退字母头像）
+  i18n:
+    en:
+      display_name: "Actual Budget"
+      description: "Privacy-focused personal budgeting with multi-device sync"
+    zh:
+      display_name: "Actual Budget 个人预算"
+      description: "支持多设备同步、注重隐私的个人预算管理器"
+
+source:
+  repo: "actualbudget/actual"
+  version_strategy: "release_tag"
+  release_filter:
+    prerelease: false
+    draft: false
+
+deploy:
+  docker_image: "ghcr.io/actualbudget/actual"
+  image_tag_template: "ghcr.io/actualbudget/actual:{version_no_v}"
+  container_port: 5006
+  compose_file: "apps/actual-budget/docker-compose.yml"
+  # extra_environment: []   # 可选：one-click 模板注入的 KEY=VALUE；含敏感词会被拒绝（规则16）
+
+health_check:
+  endpoint: "/health"
+  expected_status: 200
+  method: "GET"
+  timeout_seconds: 5
+  retries: 40
+  interval_seconds: 3
+  startup_timeout_seconds: 180
+  version_assertion:
+    kind: "api_json_path"
+    path: "/info"
+    json_pointer: "/build/version"
+    expected: "{version_no_v}"
+    match: "exact"
+
+tests:
+  predefined_dir: "apps/actual-budget/tests"
+  scenarios:
+    - slug: "welcome"
+      url: "/"
+      caption:
+        en: "Budget welcome page"
+        zh: "预算欢迎页"
+
+deployment:
+  size: "small"
+  documentation_url: "https://actualbudget.org/docs/"
+  regions: ["us-east-1"]  # v1 单区域（规则14）
+  post_deploy:
+    admin_path: "/"
+    admin_setup:
+      en: "Open /, choose the self-hosted server flow and create or import a budget. Configure server access protection from the settings screen."
+      zh: "打开 /，选择自托管服务器流程并创建或导入预算；在设置页中配置服务器访问保护。"
+    notes:
+      - en: "Account state, sync data and budget files are retained under /data."
+        zh: "账户状态、同步数据和预算文件均保留在 /data。"
+  cost_estimate:
+    monthly_usd: 23
+    note:
+      en: "Verified default in us-east-1: t3.small, 20 GB root plus 30 GB data gp3, and public IPv4; transfer and snapshots are extra."
+      zh: "us-east-1 已验证默认配置：t3.small、20GB 系统盘、30GB 数据盘与公网 IPv4；流量和快照另计。"
+  data_path: "/data"
+
+website:
+  featured: false
+  screenshots_order: ["welcome"]
+  tags: ["budget", "finance", "privacy"]
+  features:
+    - en: "Envelope-style budgeting with fast local-first workflows"
+      zh: "信封式预算与快速的本地优先工作流"
+    - en: "Sync encrypted budget data across desktop, web and mobile"
+      zh: "在桌面、Web 与移动端之间同步加密预算数据"

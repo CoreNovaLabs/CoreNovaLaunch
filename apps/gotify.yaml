@@ -1,0 +1,84 @@
+# CoreNova Launch · 应用注册（App Schema 唯一事实源）
+# 契约：contracts/app-schema.md（校验规则见 §5，共 19 条）
+# 实测 gotify/server:3.1.0 (linux/amd64)：/health 返回数据库与服务
+# green，OCI version label 为 3.1.0，SQLite 和插件数据在 /app/data。
+
+app:
+  name: "gotify"
+  category: "devops"
+  app_type: "stateful_app"
+  icon: "/icons/gotify.svg"   # Repo A 静态资产，需人工预置（缺失时官网回退字母头像）
+  i18n:
+    en:
+      display_name: "Gotify"
+      description: "Simple self-hosted server for real-time application notifications"
+    zh:
+      display_name: "Gotify 消息推送"
+      description: "用于实时应用通知的简单自托管服务器"
+
+source:
+  repo: "gotify/server"
+  version_strategy: "release_tag"
+  release_filter:
+    prerelease: false
+    draft: false
+
+deploy:
+  docker_image: "gotify/server"
+  image_tag_template: "gotify/server:{version_no_v}"
+  container_port: 80
+  compose_file: "apps/gotify/docker-compose.yml"
+  # extra_environment: []   # 可选：one-click 模板注入的 KEY=VALUE；含敏感词会被拒绝（规则16）
+
+health_check:
+  endpoint: "/health"
+  expected_status: 200
+  method: "GET"
+  timeout_seconds: 5
+  retries: 40
+  interval_seconds: 3
+  startup_timeout_seconds: 180
+  version_assertion:
+    kind: "exec_command"
+    command: >-
+      /app/gotify-app version 2>/dev/null | head -n 1 | awk '{print $2}'
+    expected: "{version_no_v}"
+    match: "exact"
+
+tests:
+  predefined_dir: "apps/gotify/tests"
+  scenarios:
+    - slug: "login"
+      url: "/"
+      caption:
+        en: "Sign-in page"
+        zh: "登录页"
+
+deployment:
+  size: "small"
+  documentation_url: "https://gotify.net/docs/"
+  regions: ["us-east-1"]  # v1 单区域（规则14）
+  post_deploy:
+    admin_path: "/"
+    admin_setup:
+      en: "Open / and follow the upstream first-login guidance, then create applications and clients from the web UI."
+      zh: "打开 /，按上游首次登录指引进入，然后在 Web UI 中创建应用与客户端。"
+    notes:
+      - en: "Messages, users, images and plugins are retained under /app/data."
+        zh: "消息、用户、图片和插件均保留在 /app/data。"
+  cost_estimate:
+    monthly_usd: 23
+    note:
+      en: "Verified default in us-east-1: t3.small, 20 GB root plus 30 GB data gp3, and public IPv4; transfer and snapshots are extra."
+      zh: "us-east-1 已验证默认配置：t3.small、20GB 系统盘、30GB 数据盘与公网 IPv4；流量和快照另计。"
+  data_path: "/app/data"
+
+website:
+  featured: false
+  screenshots_order: ["login"]
+  tags: ["notifications", "push", "api"]
+  features:
+    - en: "Send real-time messages through a small REST API"
+      zh: "通过简洁 REST API 实时发送消息"
+    - en: "Web UI, Android client and plugin support"
+      zh: "提供 Web UI、Android 客户端和插件支持"

@@ -1,0 +1,84 @@
+# CoreNova Launch · 应用注册（App Schema 唯一事实源）
+# 契约：contracts/app-schema.md（校验规则见 §5，共 19 条）
+# 实测 drakkan/sftpgo:v2.7.5 (linux/amd64)：/healthz 返回 ok，OCI
+# version label 为 v2.7.5。数据库、主机密钥与用户目录统一收敛到 /var/lib/sftpgo。
+
+app:
+  name: "sftpgo"
+  category: "productivity"
+  app_type: "stateful_app"
+  icon: "/icons/sftpgo.svg"   # Repo A 静态资产，需人工预置（缺失时官网回退字母头像）
+  i18n:
+    en:
+      display_name: "SFTPGo"
+      description: "Managed file transfer server with SFTP, HTTP, FTP and WebDAV"
+    zh:
+      display_name: "SFTPGo 文件传输"
+      description: "支持 SFTP、HTTP、FTP 与 WebDAV 的可管理文件传输服务器"
+
+source:
+  repo: "drakkan/sftpgo"
+  version_strategy: "release_tag"
+  release_filter:
+    prerelease: false
+    draft: false
+
+deploy:
+  docker_image: "drakkan/sftpgo"
+  image_tag_template: "drakkan/sftpgo:{version}"
+  container_port: 8080
+  compose_file: "apps/sftpgo/docker-compose.yml"
+  # extra_environment: []   # 可选：one-click 模板注入的 KEY=VALUE；含敏感词会被拒绝（规则16）
+
+health_check:
+  endpoint: "/healthz"
+  expected_status: 200
+  method: "GET"
+  timeout_seconds: 5
+  retries: 40
+  interval_seconds: 3
+  startup_timeout_seconds: 180
+  version_assertion:
+    kind: "exec_command"
+    command: >-
+      sftpgo --version 2>&1 | awk 'NR==1 {print $2}' | cut -d- -f1
+    expected: "{version_no_v}"
+    match: "exact"
+
+tests:
+  predefined_dir: "apps/sftpgo/tests"
+  scenarios:
+    - slug: "setup"
+      url: "/"
+      caption:
+        en: "Administrator setup"
+        zh: "管理员设置"
+
+deployment:
+  size: "small"
+  documentation_url: "https://docs.sftpgo.com/"
+  regions: ["us-east-1"]  # v1 单区域（规则14）
+  post_deploy:
+    admin_path: "/web/admin"
+    admin_setup:
+      en: "First visit redirects to the administrator setup screen. Place each user's home inside /var/lib/sftpgo/data so transferred files remain on the retained volume."
+      zh: "首次访问会跳转到管理员设置页。请将各用户主目录放在 /var/lib/sftpgo/data 下，使传输文件留在持久卷。"
+    notes:
+      - en: "This verified shape exposes and tests the HTTP administration plane; additional transfer ports require separate security-group support."
+        zh: "本验证形态只暴露并测试 HTTP 管理面；其他传输端口需要额外安全组支持。"
+  cost_estimate:
+    monthly_usd: 23
+    note:
+      en: "Verified default in us-east-1: t3.small, 20 GB root plus 30 GB data gp3, and public IPv4; transfer and snapshots are extra."
+      zh: "us-east-1 已验证默认配置：t3.small、20GB 系统盘、30GB 数据盘与公网 IPv4；流量和快照另计。"
+  data_path: "/var/lib/sftpgo"
+
+website:
+  featured: false
+  screenshots_order: ["setup"]
+  tags: ["sftp", "webdav", "file-transfer"]
+  features:
+    - en: "Manage users, quotas and virtual folders from a web UI"
+      zh: "通过 Web UI 管理用户、配额与虚拟文件夹"
+    - en: "Supports SFTP, HTTP, FTP and WebDAV storage backends"
+      zh: "支持 SFTP、HTTP、FTP 和 WebDAV 存储后端"

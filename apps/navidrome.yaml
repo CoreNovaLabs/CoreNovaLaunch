@@ -1,0 +1,86 @@
+# CoreNova Launch · 应用注册（App Schema 唯一事实源）
+# 契约：contracts/app-schema.md（校验规则见 §5，共 19 条）
+# 实测 deluan/navidrome:0.64.0 (linux/amd64)：服务就绪后 / 跳转至
+# Web UI，OCI version label 为 0.64.0。用 /storage 统一持久化数据与音乐。
+
+app:
+  name: "navidrome"
+  category: "media"
+  app_type: "stateful_app"
+  icon: "/icons/navidrome.svg"   # Repo A 静态资产，需人工预置（缺失时官网回退字母头像）
+  i18n:
+    en:
+      display_name: "Navidrome"
+      description: "Modern personal music server compatible with Subsonic clients"
+    zh:
+      display_name: "Navidrome 音乐服务器"
+      description: "兼容 Subsonic 客户端的现代个人音乐服务器"
+
+source:
+  repo: "navidrome/navidrome"
+  version_strategy: "release_tag"
+  release_filter:
+    prerelease: false
+    draft: false
+
+deploy:
+  docker_image: "deluan/navidrome"
+  image_tag_template: "deluan/navidrome:{version_no_v}"
+  container_port: 4533
+  compose_file: "apps/navidrome/docker-compose.yml"
+  extra_environment:
+    - "ND_DATAFOLDER=/storage/data"
+    - "ND_MUSICFOLDER=/storage/music"
+
+health_check:
+  endpoint: "/"
+  expected_status: 200
+  method: "GET"
+  timeout_seconds: 5
+  retries: 40
+  interval_seconds: 3
+  startup_timeout_seconds: 180
+  version_assertion:
+    kind: "exec_command"
+    command: >-
+      /app/navidrome --version 2>&1 | awk 'NR==1 {print $1}'
+    expected: "{version_no_v}"
+    match: "exact"
+
+tests:
+  predefined_dir: "apps/navidrome/tests"
+  scenarios:
+    - slug: "setup"
+      url: "/"
+      caption:
+        en: "Admin setup"
+        zh: "管理员设置"
+
+deployment:
+  size: "small"
+  documentation_url: "https://www.navidrome.org/docs/"
+  regions: ["us-east-1"]  # v1 单区域（规则14）
+  post_deploy:
+    admin_path: "/"
+    admin_setup:
+      en: "First visit opens the administrator creation screen. Upload music under /storage/music before running a library scan."
+      zh: "首次访问会进入管理员创建页。运行媒体库扫描前，请将音乐上传到 /storage/music。"
+    notes:
+      - en: "The database, cache and music library share one retained root at /storage."
+        zh: "数据库、缓存与音乐库共用 /storage 持久根目录。"
+  cost_estimate:
+    monthly_usd: 23
+    note:
+      en: "Verified default in us-east-1: t3.small, 20 GB root plus 30 GB data gp3, and public IPv4; media storage, transfer and snapshots are extra."
+      zh: "us-east-1 已验证默认配置：t3.small、20GB 系统盘、30GB 数据盘与公网 IPv4；媒体存储、流量和快照另计。"
+  data_path: "/storage"
+
+website:
+  featured: false
+  screenshots_order: ["setup"]
+  tags: ["music", "streaming", "subsonic"]
+  features:
+    - en: "Stream a personal music library to web and Subsonic clients"
+      zh: "将个人音乐库串流到 Web 与 Subsonic 客户端"
+    - en: "Fast library scanning, playlists and transcoding"
+      zh: "快速媒体库扫描、播放列表与转码"
