@@ -68,6 +68,18 @@
 
 ## Batch 3 · 文件分发与对象存储
 
+2026-09-18：Dufs `v0.46.0` 已接入公开只读形态，禁止匿名上传、删除及 WebDAV 写入。
+已补充无 shell 镜像的 argv 版本断言，保留原字符串命令兼容性，238 项回归测试通过。
+本机 Docker API 无响应，未重启或影响其他容器；完整验证交由
+[CI 验证任务](https://github.com/CoreNovaLabs/CoreNovaLaunchVerify/actions/runs/35349743323)，
+CI 的 `verify dufs` 已成功，公开 `current.json` 已确认发布版本 `v0.46.0`，
+验证编号 `dufs-v0.46.0-20260918-001`（本批已发布 1/10）。
+
+本批其他候选保持待接入，不计作已上架：PairDrop 需要核实 HTTPS 反代的
+WebSocket 与客户端 IP 转发；copyparty 默认匿名可写，需要安全配置初始化；
+Gokapi 需要解决上传分块与代理请求体限制；PicoShare 需要私密凭据注入；
+FileGator 的数据和配置持久化路径需要适配。对象存储类仍按表中前置条件审计。
+
 | # | 应用 | 上游 | 核心价值 | 预计门禁 |
 |---:|---|---|---|---|
 | 21 | ownCloud Infinite Scale | `owncloud/ocis` | 现代文件同步与共享 | 单二进制组合模式审计 |
