@@ -30,8 +30,7 @@ deploy:
   image_tag_template: "gitea/gitea:{version_no_v}"
   container_port: 3000
   compose_file: "apps/gitea/docker-compose.yml"
-  extra_environment:
-    - "GITEA__server__ROOT_URL=${CORENOVA_APP_URL}"
+  extra_environment: []
 
 health_check:
   # 全新容器首启：/ 303 到 /install 安装向导，落点 200（探针跟随重定向）。

@@ -84,7 +84,7 @@ Parameters:
   LaunchUrl:
     Type: String
     Default: ""
-    AllowedPattern: ^$|^https?://\S+$
+    AllowedPattern: '^$|^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~%/+?=&-]*)?$'
     Description: >
       Public URL of this deployment, supplied by the user at deploy time (the stack outputs
       ResolvedLaunchUrl when left empty). Injected into the container as CORENOVA_APP_URL so the
@@ -93,6 +93,7 @@ Parameters:
   Hostnames:
     Type: CommaDelimitedList
     Default: ""
+    AllowedPattern: '^$|^[A-Za-z0-9][A-Za-z0-9.-]*$'
     Description: >
       Extra nginx server_name entries (e.g. app.example.com). A '_' catch-all is always kept,
       so access by public DNS keeps working before DNS points at the instance.
@@ -153,6 +154,47 @@ Parameters:
       Newline separated non-sensitive KEY=VALUE lines appended to the container environment file.
       Secrets must use SSM Parameter Store or Secrets Manager; CloudFormation parameters are visible.
 
+  AllowedWebCidr:
+    Type: String
+    Default: 127.0.0.1/32
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/([0-9]|[12][0-9]|3[0-2])$'
+    Description: >
+      管理入口允许的 IPv4 CIDR。默认仅限本机（通过 SSM 端口转发访问）；
+      如需直连，填写管理员或 VPN 出口 CIDR，并同步收窄网络栈的 HttpIngressCidr。
+      0.0.0.0/0 仅用于已经配置应用认证和 HTTPS 的公开服务。
+  MaxUploadSizeMb:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 10240
+    Description: HTTP/HTTPS 统一上传上限（MiB）；应用自身限制仍有效。
+  DockerSocketAccess:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      显式挂载宿主机 Docker socket（例如 Portainer 管理本机）。相当于授予宿主机 root 权限，
+      默认关闭；启用前必须限制管理入口并完成认证，不属于默认验证范围。
+  ExtraTcpPort:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 65535
+    Description: 可选 TCP 业务端口（容器和宿主机同号，1024-65535；0 关闭），不得等于管理端口。
+  ExtraUdpPort:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 65535
+    Description: 可选 UDP 业务端口（容器和宿主机同号，1024-65535；0 关闭），不得等于管理端口。
+  ExtraPortIngressCidr:
+    Type: String
+    Default: 127.0.0.1/32
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/([0-9]|[12][0-9]|3[0-2])$'
+    Description: >
+      额外业务端口的对端 IPv4 CIDR，与 Web 管理入口独立；默认无公网对端。
+      规则添加到 SecurityGroupId；已有网络部署应使用该实例独占的安全组。
+
   InitOverrideUrl:
     Type: String
     Default: ""
@@ -200,8 +242,31 @@ Conditions:
   LaunchUrlGiven: {Fn::Not: [{Fn::Equals: [{Ref: LaunchUrl}, ""]}]}
   GoldenRunGiven: {Fn::Not: [{Fn::Equals: [{Ref: GoldenRunId}, ""]}]}
   ProtectInstance: {Fn::Equals: [{Ref: TerminationProtection}, Enabled]}
+  ExtraTcpEnabled: {Fn::Not: [{Fn::Equals: [{Ref: ExtraTcpPort}, 0]}]}
+  ExtraUdpEnabled: {Fn::Not: [{Fn::Equals: [{Ref: ExtraUdpPort}, 0]}]}
 
 Resources:
+  ExtraTcpIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ExtraTcpEnabled
+    Properties:
+      GroupId: {Ref: SecurityGroupId}
+      IpProtocol: tcp
+      FromPort: {Ref: ExtraTcpPort}
+      ToPort: {Ref: ExtraTcpPort}
+      CidrIp: {Ref: ExtraPortIngressCidr}
+      Description: Explicit TCP application port
+  ExtraUdpIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ExtraUdpEnabled
+    Properties:
+      GroupId: {Ref: SecurityGroupId}
+      IpProtocol: udp
+      FromPort: {Ref: ExtraUdpPort}
+      ToPort: {Ref: ExtraUdpPort}
+      CidrIp: {Ref: ExtraPortIngressCidr}
+      Description: Explicit UDP application port
+
   WaitHandle:
     Type: AWS::CloudFormation::WaitConditionHandle
 
@@ -401,6 +466,11 @@ Resources:
                     export CFNOVA_SERVER_NAMES="${ServerNames}"
                     export CFNOVA_TLS_PEM_PATH="${TlsPemPath}"
                     export CFNOVA_SELF_SIGNED_TLS="${SelfSignedTls}"
+                    export CFNOVA_ALLOWED_WEB_CIDR="${AllowedWebCidr}"
+                    export CFNOVA_MAX_BODY_MB="${MaxUploadSizeMb}"
+                    export CFNOVA_DOCKER_SOCKET_ACCESS="${DockerSocketAccess}"
+                    export CFNOVA_EXTRA_TCP_PORT="${ExtraTcpPort}"
+                    export CFNOVA_EXTRA_UDP_PORT="${ExtraUdpPort}"
                     export CFNOVA_LOG_GROUP="${CloudWatchLogGroupName}"
                     export CFNOVA_STACK_NAME="${AWS::StackName}"
                     export CFNOVA_AWS_REGION="${AWS::Region}"
@@ -420,7 +490,7 @@ Resources:
                   - {}
               mode: "000640"
               owner: root
-              group: corenova
+              group: corenova-app
             /opt/corenova/bin/00-packages-and-docker-runtime.sh:
               content: |
                 # BEGIN SYNCED ASSET 00-packages-and-docker-runtime.sh
@@ -484,6 +554,12 @@ Resources:
                 SERVER_NAMES="${CFNOVA_SERVER_NAMES:-}"
                 TLS_PEM_PATH="${CFNOVA_TLS_PEM_PATH:-}"
                 SELF_SIGNED_TLS="${CFNOVA_SELF_SIGNED_TLS:-false}"
+                ALLOWED_WEB_CIDR="${CFNOVA_ALLOWED_WEB_CIDR:-127.0.0.1/32}"
+                MAX_BODY_MB="${CFNOVA_MAX_BODY_MB:-100}"
+
+                # 默认仅允许 SSM 转发后的本机访问；不信任客户端提供的转发地址。
+                python3 -c 'import ipaddress, sys; ipaddress.IPv4Network(sys.argv[1], strict=False)' "$ALLOWED_WEB_CIDR"
+                [[ "$MAX_BODY_MB" =~ ^[1-9][0-9]{0,4}$ ]] && (( MAX_BODY_MB <= 10240 )) || exit 1
 
                 install -d -m 0755 /etc/nginx/tls /var/log/nginx
                 DEBIAN_FRONTEND=noninteractive apt-get install -y nginx logrotate || {
@@ -509,6 +585,31 @@ Resources:
                   TLS_PEM_PATH=/etc/nginx/tls/corenova-selfsigned.pem
                 fi
 
+                # HTTP 与 HTTPS 使用同一组代理、上传和访问控制指令，避免两条入口漂移。
+                install -d -m 0755 /etc/nginx/snippets
+                cat > /etc/nginx/snippets/corenova-app.conf <<EOF
+                allow 127.0.0.1;
+                allow ::1;
+                allow ${ALLOWED_WEB_CIDR};
+                deny all;
+                client_max_body_size ${MAX_BODY_MB}m;
+                client_body_timeout 300s;
+                location / {
+                  proxy_pass http://corenova_${APP_NAME};
+                  proxy_http_version 1.1;
+                  proxy_set_header Host \$http_host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$remote_addr;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+                  proxy_set_header Upgrade \$http_upgrade;
+                  proxy_set_header Connection \$connection_upgrade;
+                  proxy_read_timeout 3600s;
+                  proxy_send_timeout 3600s;
+                  proxy_request_buffering off;
+                  proxy_buffering off;
+                }
+                EOF
+
                 cat > /etc/nginx/conf.d/corenova-proxy.conf <<EOF
                 map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
 
@@ -521,25 +622,8 @@ Resources:
                   listen 80 default_server;
                   listen [::]:80 default_server;
                   server_name _ ${SERVER_NAMES};
-
                   access_log /var/log/nginx/corenova-${APP_NAME}.access.log;
-
-                  location = /corenova-health {
-                    access_log off;
-                    proxy_pass http://corenova_${APP_NAME};
-                  }
-
-                  location / {
-                    proxy_pass http://corenova_${APP_NAME};
-                    proxy_http_version 1.1;
-                    proxy_set_header Host \$host;
-                    proxy_set_header X-Real-IP \$remote_addr;
-                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                    proxy_set_header X-Forwarded-Proto \$scheme;
-                    proxy_set_header Upgrade \$http_upgrade;
-                    proxy_set_header Connection \$connection_upgrade;
-                    proxy_read_timeout 90s;
-                  }
+                  include /etc/nginx/snippets/corenova-app.conf;
                 }
                 EOF
 
@@ -553,12 +637,8 @@ Resources:
                   ssl_certificate ${TLS_PEM_PATH};
                   ssl_certificate_key ${TLS_PEM_PATH};
                   ssl_protocols TLSv1.2 TLSv1.3;
-                  location / {
-                    proxy_pass http://corenova_${APP_NAME};
-                    proxy_http_version 1.1;
-                    proxy_set_header Host \$host;
-                    proxy_set_header X-Forwarded-Proto \$scheme;
-                  }
+                  access_log /var/log/nginx/corenova-${APP_NAME}.access.log;
+                  include /etc/nginx/snippets/corenova-app.conf;
                 }
                 EOF
                 fi
@@ -664,14 +744,39 @@ Resources:
                 LOG_GROUP="${CFNOVA_LOG_GROUP:-/corenova/apps}"
                 AWS_REGION="${CFNOVA_AWS_REGION:-us-east-1}"
                 ENV_FILE="/opt/corenova/env/${APP_NAME}.env"
+                DOCKER_SOCKET_ACCESS="${CFNOVA_DOCKER_SOCKET_ACCESS:-false}"
+                EXTRA_TCP_PORT="${CFNOVA_EXTRA_TCP_PORT:-0}"
+                EXTRA_UDP_PORT="${CFNOVA_EXTRA_UDP_PORT:-0}"
+
+                # 仅允许结构化选项，禁止向 systemd 注入任意 Docker 参数。
+                EXTRA_ARGS=""
+                case "$DOCKER_SOCKET_ACCESS" in
+                  true)
+                    [ -S /var/run/docker.sock ] || { echo '[corenova] Docker socket 不存在'; exit 1; }
+                    EXTRA_ARGS="--mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock"
+                    ;;
+                  false) ;;
+                  *) exit 1 ;;
+                esac
+                for protocol in tcp udp; do
+                  if [ "$protocol" = tcp ]; then port="$EXTRA_TCP_PORT"; else port="$EXTRA_UDP_PORT"; fi
+                  [[ "$port" =~ ^(0|[1-9][0-9]{0,4})$ ]] || exit 1
+                  if [ "$port" != 0 ]; then
+                    # 禁止绕过管理入口代理，也不得占用 SSH/HTTP(S)。
+                    if (( port > 65535 || port < 1024 || port == CONTAINER_PORT )); then
+                      echo '[corenova] 额外端口必须为独立的非特权业务端口'; exit 1
+                    fi
+                    EXTRA_ARGS="$EXTRA_ARGS -p 0.0.0.0:${port}:${port}/${protocol}"
+                  fi
+                done
 
                 # LaunchUrl is optional because the instance public DNS name only exists after launch.
                 # Resolve it through IMDSv2 so apps such as Ghost receive a correct absolute base URL.
                 if [ -z "$APP_URL" ]; then
                   set +x
-                  IMDS_TOKEN="$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token || true)"
+                  IMDS_TOKEN="$(curl -fsS --connect-timeout 2 --max-time 5 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token || true)"
                   if [ -n "$IMDS_TOKEN" ]; then
-                    PUBLIC_DNS="$(curl -fsS -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" http://169.254.169.254/latest/meta-data/public-hostname || true)"
+                    PUBLIC_DNS="$(curl -fsS --connect-timeout 2 --max-time 5 -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" http://169.254.169.254/latest/meta-data/public-hostname || true)"
                     if [ -n "$PUBLIC_DNS" ]; then
                       APP_URL="http://${PUBLIC_DNS}"
                     fi
@@ -679,7 +784,42 @@ Resources:
                   set -x
                 fi
 
-                install -d -m 0755 "$DATA_DIR"
+                # 规范化根 URL，追加环境变量中的 / 不会生成双斜杠。
+                APP_URL="${APP_URL%/}"
+                if [ -n "$APP_URL_ENV_NAME" ]; then
+                  [[ "$APP_URL_ENV_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || exit 1
+                  [ -n "$APP_URL" ] || { echo '[corenova] 无法解析应用 URL'; exit 1; }
+                fi
+
+                # 已有目录不重设 mode，不递归修改已有数据。
+                [ -d "$DATA_DIR" ] || install -d -m 0755 "$DATA_DIR"
+                docker pull "$IMAGE_REFERENCE"
+                IMAGE_USER="$(docker image inspect --format '{{.Config.User}}' "$IMAGE_REFERENCE")"
+                if [ -n "$IMAGE_USER" ] && [ "$IMAGE_USER" != root ] && [ "$IMAGE_USER" != 0 ]; then
+                  # Run only id, without network, writable rootfs, host mounts or application entrypoint.
+                  if [[ "$IMAGE_USER" =~ ^([0-9]+):([0-9]+)$ ]]; then
+                    DATA_UID="${BASH_REMATCH[1]}"
+                    DATA_GID="${BASH_REMATCH[2]}"
+                  elif [[ "$IMAGE_USER" =~ ^[0-9]+$ ]]; then
+                    # distroless 镜像可能没有 id；数字 UID 已足以保证 owner 可写，不猜测组号。
+                    DATA_UID="$IMAGE_USER"
+                    DATA_GID=""
+                  else
+                    DATA_UID="$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --entrypoint id "$IMAGE_REFERENCE" -u)"
+                    DATA_GID="$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --entrypoint id "$IMAGE_REFERENCE" -g)"
+                  fi
+                  [[ "$DATA_UID" =~ ^[0-9]+$ && "$DATA_GID" =~ ^[0-9]*$ ]] || exit 1
+                  DATA_OWNER="${DATA_UID}${DATA_GID:+:$DATA_GID}"
+                  OWNER_FORMAT='%u'
+                  [ -z "$DATA_GID" ] || OWNER_FORMAT='%u:%g'
+                  # 新 ext4 卷自带 lost+found；它不是应用数据，不能导致首次部署被拒。
+                  if [ -z "$(find "$DATA_DIR" -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit)" ]; then
+                    chown "$DATA_OWNER" "$DATA_DIR"
+                  elif [ "$(stat -c "$OWNER_FORMAT" "$DATA_DIR")" != "$DATA_OWNER" ]; then
+                    echo '[corenova] existing data ownership requires operator review; refusing recursive chown'
+                    exit 1
+                  fi
+                fi
                 mkdir -p /opt/corenova/env
 
                 cat > "$ENV_FILE" <<EOF
@@ -688,13 +828,29 @@ Resources:
                 CORENOVA_DATA_DIR=${DATA_DIR}
                 CORENOVA_APP_URL=${APP_URL}
                 EOF
-                if [ -n "$APP_URL_ENV_NAME" ] && [ -n "$APP_URL" ]; then
+                if [ -n "$EXTRA_ENV_FILE" ] && [ -s "$EXTRA_ENV_FILE" ]; then
+                  # Expand only the supported URL placeholder; never eval arbitrary config.
+                  while IFS= read -r line || [ -n "$line" ]; do
+                    case "$line" in ''|'#'*) continue ;; esac
+                    [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*=.+$ && "$line" != *$'\r'* ]] || {
+                      echo '[corenova] 环境变量必须为单行 KEY=VALUE'; exit 1;
+                    }
+                    if [[ "$line" == *'${CORENOVA_APP_URL}'* ]] && [ -z "$APP_URL" ]; then
+                      echo '[corenova] 无法解析应用 URL'; exit 1
+                    fi
+                    line="${line//\$\{CORENOVA_APP_URL\}/$APP_URL}"
+                    if [[ "$line" == *'${'* ]]; then
+                      echo '[corenova] unsupported environment placeholder'; exit 1
+                    fi
+                    # 原生 URL 字段优先，兼容旧 Manifest 中重复的 URL 行。
+                    [ "${line%%=*}" = "$APP_URL_ENV_NAME" ] && continue
+                    printf '%s\n' "$line" >> "$ENV_FILE"
+                  done < "$EXTRA_ENV_FILE"
+                fi
+                if [ -n "$APP_URL_ENV_NAME" ]; then
                   printf '%s=%s\n' "$APP_URL_ENV_NAME" "$APP_URL" >> "$ENV_FILE"
                 fi
-                if [ -n "$EXTRA_ENV_FILE" ] && [ -s "$EXTRA_ENV_FILE" ]; then
-                  cat "$EXTRA_ENV_FILE" >> "$ENV_FILE"
-                fi
-                chown root:corenova "$ENV_FILE"
+                chown root:corenova-app "$ENV_FILE"
                 chmod 0640 "$ENV_FILE"
 
                 cat > "/etc/systemd/system/corenova-${APP_NAME}.service" <<EOF
@@ -707,7 +863,6 @@ Resources:
                 Type=simple
                 Restart=always
                 RestartSec=5
-                EnvironmentFile=${ENV_FILE}
                 ExecStartPre=-/usr/bin/docker rm -f ${APP_NAME}
                 ExecStartPre=/usr/bin/docker pull ${IMAGE_REFERENCE}
                 ExecStart=/usr/bin/docker run --rm --name ${APP_NAME} \\
@@ -717,6 +872,7 @@ Resources:
                   -p 127.0.0.1:${CONTAINER_PORT}:${CONTAINER_PORT} \\
                   -v ${DATA_DIR}:${DATA_MOUNT} \\
                   --env-file ${ENV_FILE} \\
+                  ${EXTRA_ARGS} \\
                   ${IMAGE_REFERENCE}
                 ExecStop=/usr/bin/docker stop ${APP_NAME}
 

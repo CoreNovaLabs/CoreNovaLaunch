@@ -98,6 +98,13 @@ def build() -> dict:
                     {"Label": {"default": "Host"}, "Parameters": [
                         "InstanceType", "DiskGb", "DataVolumeSize", "AmiId",
                     ]},
+                    {"Label": {"default": "访问控制与上传"}, "Parameters": [
+                        "AllowedWebCidr", "HttpIngressCidr", "MaxUploadSizeMb",
+                        "LaunchUrl", "Hostnames", "TlsPemPath", "SelfSignedTls",
+                    ]},
+                    {"Label": {"default": "显式启用的能力（非默认验证配置）"}, "Parameters": [
+                        "DockerSocketAccess", "ExtraTcpPort", "ExtraUdpPort", "ExtraPortIngressCidr",
+                    ]},
                 ],
                 "ParameterLabels": {
                     "ImageReference": {

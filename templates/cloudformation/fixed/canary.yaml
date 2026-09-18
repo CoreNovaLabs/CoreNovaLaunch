@@ -63,13 +63,14 @@ Parameters:
   LaunchUrl:
     Type: String
     Default: ''
-    AllowedPattern: ^$|^https?://\S+$
+    AllowedPattern: ^$|^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~%/+?=&-]*)?$
     Description: 'Public URL of this deployment, supplied by the user at deploy time (the stack outputs ResolvedLaunchUrl when left empty). Injected into the container as CORENOVA_APP_URL so the app builds correct absolute links. Empty means "reachable through the instance public DNS name".
 
       '
   Hostnames:
     Type: CommaDelimitedList
     Default: ''
+    AllowedPattern: ^$|^[A-Za-z0-9][A-Za-z0-9.-]*$
     Description: 'Extra nginx server_name entries (e.g. app.example.com). A ''_'' catch-all is always kept, so access by public DNS keeps working before DNS points at the instance.
 
       '
@@ -121,6 +122,47 @@ Parameters:
     Type: String
     Default: ''
     Description: 'Newline separated non-sensitive KEY=VALUE lines appended to the container environment file. Secrets must use SSM Parameter Store or Secrets Manager; CloudFormation parameters are visible.
+
+      '
+  AllowedWebCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/([0-9]|[12][0-9]|3[0-2])$
+    Description: '管理入口允许的 IPv4 CIDR。默认仅限本机（通过 SSM 端口转发访问）； 如需直连，填写管理员或 VPN 出口 CIDR，并同步收窄网络栈的 HttpIngressCidr。 0.0.0.0/0 仅用于已经配置应用认证和 HTTPS 的公开服务。
+
+      '
+  MaxUploadSizeMb:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 10240
+    Description: HTTP/HTTPS 统一上传上限（MiB）；应用自身限制仍有效。
+  DockerSocketAccess:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+    - 'true'
+    - 'false'
+    Description: '显式挂载宿主机 Docker socket（例如 Portainer 管理本机）。相当于授予宿主机 root 权限， 默认关闭；启用前必须限制管理入口并完成认证，不属于默认验证范围。
+
+      '
+  ExtraTcpPort:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 65535
+    Description: 可选 TCP 业务端口（容器和宿主机同号，1024-65535；0 关闭），不得等于管理端口。
+  ExtraUdpPort:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 65535
+    Description: 可选 UDP 业务端口（容器和宿主机同号，1024-65535；0 关闭），不得等于管理端口。
+  ExtraPortIngressCidr:
+    Type: String
+    Default: 127.0.0.1/32
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/([0-9]|[12][0-9]|3[0-2])$
+    Description: '额外业务端口的对端 IPv4 CIDR，与 Web 管理入口独立；默认无公网对端。 规则添加到 SecurityGroupId；已有网络部署应使用该实例独占的安全组。
 
       '
   InitOverrideUrl:
@@ -175,7 +217,45 @@ Conditions:
     Fn::Equals:
     - Ref: TerminationProtection
     - Enabled
+  ExtraTcpEnabled:
+    Fn::Not:
+    - Fn::Equals:
+      - Ref: ExtraTcpPort
+      - 0
+  ExtraUdpEnabled:
+    Fn::Not:
+    - Fn::Equals:
+      - Ref: ExtraUdpPort
+      - 0
 Resources:
+  ExtraTcpIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ExtraTcpEnabled
+    Properties:
+      GroupId:
+        Ref: SecurityGroupId
+      IpProtocol: tcp
+      FromPort:
+        Ref: ExtraTcpPort
+      ToPort:
+        Ref: ExtraTcpPort
+      CidrIp:
+        Ref: ExtraPortIngressCidr
+      Description: Explicit TCP application port
+  ExtraUdpIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ExtraUdpEnabled
+    Properties:
+      GroupId:
+        Ref: SecurityGroupId
+      IpProtocol: udp
+      FromPort:
+        Ref: ExtraUdpPort
+      ToPort:
+        Ref: ExtraUdpPort
+      CidrIp:
+        Ref: ExtraPortIngressCidr
+      Description: Explicit UDP application port
   WaitHandle:
     Type: AWS::CloudFormation::WaitConditionHandle
   WaitCondition:
@@ -356,6 +436,16 @@ Resources:
 
                   export CFNOVA_SELF_SIGNED_TLS="${SelfSignedTls}"
 
+                  export CFNOVA_ALLOWED_WEB_CIDR="${AllowedWebCidr}"
+
+                  export CFNOVA_MAX_BODY_MB="${MaxUploadSizeMb}"
+
+                  export CFNOVA_DOCKER_SOCKET_ACCESS="${DockerSocketAccess}"
+
+                  export CFNOVA_EXTRA_TCP_PORT="${ExtraTcpPort}"
+
+                  export CFNOVA_EXTRA_UDP_PORT="${ExtraUdpPort}"
+
                   export CFNOVA_LOG_GROUP="${CloudWatchLogGroupName}"
 
                   export CFNOVA_STACK_NAME="${AWS::StackName}"
@@ -387,14 +477,14 @@ Resources:
                 - {}
               mode: '000640'
               owner: root
-              group: corenova
+              group: corenova-app
             /opt/corenova/bin/00-packages-and-docker-runtime.sh:
               content: "# BEGIN SYNCED ASSET 00-packages-and-docker-runtime.sh\n#!/bin/bash\n# cfn-init asset: installs the Docker engine on a public (unmodified) Ubuntu AMI.\n# Filename must keep the substring \"docker\" - platformref.compute_revisions() keys\n# docker_runtime_revision off it, and the Platform Contract invalidation rule §5 depends on it.\nset -xeuo pipefail\n\nexport DEBIAN_FRONTEND=noninteractive\n. /etc/os-release\n\ninstall -d -m 0755 /etc/apt/keyrings /opt/corenova/bin /var/log/corenova\n\nif command -v dockerd >/dev/null 2>&1; then\n  echo \"[corenova] docker already present: $(docker --version)\"\nelse\n  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc\n  echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable\" \\\n    > /etc/apt/sources.list.d/docker.list\n  apt-get update -y\n  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin\nfi\n\ncat > /etc/docker/daemon.json <<'JSON'\n{\n  \"log-driver\": \"json-file\",\n  \"log-opts\": { \"max-size\": \"10m\", \"max-file\": \"3\" },\n  \"live-restore\": true,\n  \"default-address-pools\": [{ \"base\": \"172.28.0.0/16\", \"size\": 24 }]\n}\nJSON\n\nsystemctl daemon-reload\nsystemctl enable docker\nsystemctl restart docker\n\nfor who in ubuntu corenova; do\n  id -u \"$who\" >/dev/null 2>&1 && usermod -aG docker \"$who\" || true\ndone\n\n# Proof of life for the runtime, before any application image is involved.\ndocker version\ndocker info --format '{{.ServerVersion}} {{.OperatingSystem}}'\ndocker run --rm \"${CFNOVA_SMOKE_IMAGE:-alpine:3.20}\" /bin/sh -c 'echo docker-run-ok'\n# END SYNCED ASSET 00-packages-and-docker-runtime.sh\n"
               mode: '000755'
               owner: root
               group: root
             /opt/corenova/bin/10-nginx-base.sh:
-              content: "# BEGIN SYNCED ASSET 10-nginx-base.sh\n#!/bin/bash\n# cfn-init asset: renders the nginx reverse proxy that fronts every CoreNova app container.\n# Filename keeps the substring \"nginx\" so platformref.compute_revisions() can key\n# nginx_base_revision off it (Platform Contract §2.1 public-mode mapping).\nset -xeuo pipefail\n\nAPP_NAME=\"${CFNOVA_APP_NAME:?}\"\nCONTAINER_PORT=\"${CFNOVA_CONTAINER_PORT:?}\"\nSERVER_NAMES=\"${CFNOVA_SERVER_NAMES:-}\"\nTLS_PEM_PATH=\"${CFNOVA_TLS_PEM_PATH:-}\"\nSELF_SIGNED_TLS=\"${CFNOVA_SELF_SIGNED_TLS:-false}\"\n\ninstall -d -m 0755 /etc/nginx/tls /var/log/nginx\nDEBIAN_FRONTEND=noninteractive apt-get install -y nginx logrotate || {\n  echo \"[corenova] nginx install failed\"; exit 1;\n}\n# Ubuntu 的 nginx 包自带 sites-enabled/default（也是 80 default_server），\n# 与我们这份 conf 并存会让 nginx -t 直接失败（实测 duplicate default server）。\nrm -f /etc/nginx/sites-enabled/default\n\nif [ -n \"$TLS_PEM_PATH\" ] && [ ! -s \"$TLS_PEM_PATH\" ]; then\n  echo \"[corenova] WARN: TlsPemPath=$TLS_PEM_PATH is missing or empty, 443 stays closed\"\n  TLS_PEM_PATH=\"\"\nfi\n\nif [ -z \"$TLS_PEM_PATH\" ] && [ \"$SELF_SIGNED_TLS\" = \"true\" ]; then\n  # Golden Verification must measure a real 443 listener; a self-signed bundle is enough because\n  # the probe asserts reachability through the SG, not certificate trust.\n  openssl req -x509 -newkey rsa:2048 -nodes -days 365 \\\n    -keyout /etc/nginx/tls/corenova-selfsigned.pem \\\n    -out /etc/nginx/tls/corenova-selfsigned.pem \\\n    -subj \"/CN=corenova-canary\" >/dev/null 2>&1\n  chmod 0600 /etc/nginx/tls/corenova-selfsigned.pem\n  TLS_PEM_PATH=/etc/nginx/tls/corenova-selfsigned.pem\nfi\n\ncat > /etc/nginx/conf.d/corenova-proxy.conf <<EOF\nmap \\$http_upgrade \\$connection_upgrade { default upgrade; '' close; }\n\nupstream corenova_${APP_NAME} {\n  server 127.0.0.1:${CONTAINER_PORT} max_fails=3 fail_timeout=10s;\n  keepalive 16;\n}\n\nserver {\n  listen 80 default_server;\n  listen [::]:80 default_server;\n  server_name _ ${SERVER_NAMES};\n\n  access_log /var/log/nginx/corenova-${APP_NAME}.access.log;\n\n  location = /corenova-health {\n    access_log off;\n    proxy_pass http://corenova_${APP_NAME};\n  }\n\n  location / {\n    proxy_pass http://corenova_${APP_NAME};\n    proxy_http_version 1.1;\n    proxy_set_header Host \\$host;\n    proxy_set_header X-Real-IP \\$remote_addr;\n    proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto \\$scheme;\n    proxy_set_header Upgrade \\$http_upgrade;\n    proxy_set_header Connection \\$connection_upgrade;\n    proxy_read_timeout 90s;\n  }\n}\nEOF\n\nif [ -n \"$TLS_PEM_PATH\" ]; then\n  cat >> /etc/nginx/conf.d/corenova-proxy.conf <<EOF\n\nserver {\n  listen 443 ssl default_server;\n  listen [::]:443 ssl default_server;\n  server_name _ ${SERVER_NAMES};\n  ssl_certificate ${TLS_PEM_PATH};\n  ssl_certificate_key ${TLS_PEM_PATH};\n  ssl_protocols TLSv1.2 TLSv1.3;\n  location / {\n    proxy_pass http://corenova_${APP_NAME};\n    proxy_http_version 1.1;\n    proxy_set_header Host \\$host;\n    proxy_set_header X-Forwarded-Proto \\$scheme;\n  }\n}\nEOF\nfi\n\nnginx -t\nsystemctl daemon-reload\nsystemctl enable nginx\nsystemctl restart nginx\necho \"[corenova] nginx serving for ${APP_NAME} on 127.0.0.1:${CONTAINER_PORT}\"\n\n# Logrotate: keep 7 days of platform and nginx logs. The corenova log directory\n# and nginx access log are not covered by any package-provided logrotate rule.\ncat > /etc/logrotate.d/corenova <<EOF\n/var/log/corenova/*.log {\n    daily\n    rotate 7\n    compress\n    missingok\n    notifempty\n    copytruncate\n}\n/var/log/nginx/corenova-*.access.log {\n    daily\n    rotate 7\n    compress\n    missingok\n    notifempty\n    copytruncate\n}\nEOF\n# END SYNCED ASSET 10-nginx-base.sh\n"
+              content: "# BEGIN SYNCED ASSET 10-nginx-base.sh\n#!/bin/bash\n# cfn-init asset: renders the nginx reverse proxy that fronts every CoreNova app container.\n# Filename keeps the substring \"nginx\" so platformref.compute_revisions() can key\n# nginx_base_revision off it (Platform Contract §2.1 public-mode mapping).\nset -xeuo pipefail\n\nAPP_NAME=\"${CFNOVA_APP_NAME:?}\"\nCONTAINER_PORT=\"${CFNOVA_CONTAINER_PORT:?}\"\nSERVER_NAMES=\"${CFNOVA_SERVER_NAMES:-}\"\nTLS_PEM_PATH=\"${CFNOVA_TLS_PEM_PATH:-}\"\nSELF_SIGNED_TLS=\"${CFNOVA_SELF_SIGNED_TLS:-false}\"\nALLOWED_WEB_CIDR=\"${CFNOVA_ALLOWED_WEB_CIDR:-127.0.0.1/32}\"\nMAX_BODY_MB=\"${CFNOVA_MAX_BODY_MB:-100}\"\n\n# 默认仅允许 SSM 转发后的本机访问；不信任客户端提供的转发地址。\npython3 -c 'import ipaddress, sys; ipaddress.IPv4Network(sys.argv[1], strict=False)' \"$ALLOWED_WEB_CIDR\"\n[[ \"$MAX_BODY_MB\" =~ ^[1-9][0-9]{0,4}$ ]] && (( MAX_BODY_MB <= 10240 )) || exit 1\n\ninstall -d -m 0755 /etc/nginx/tls /var/log/nginx\nDEBIAN_FRONTEND=noninteractive apt-get install -y nginx logrotate || {\n  echo \"[corenova] nginx install failed\"; exit 1;\n}\n# Ubuntu 的 nginx 包自带 sites-enabled/default（也是 80 default_server），\n# 与我们这份 conf 并存会让 nginx -t 直接失败（实测 duplicate default server）。\nrm -f /etc/nginx/sites-enabled/default\n\nif [ -n \"$TLS_PEM_PATH\" ] && [ ! -s \"$TLS_PEM_PATH\" ]; then\n  echo \"[corenova] WARN: TlsPemPath=$TLS_PEM_PATH is missing or empty, 443 stays closed\"\n  TLS_PEM_PATH=\"\"\nfi\n\nif [ -z \"$TLS_PEM_PATH\" ] && [ \"$SELF_SIGNED_TLS\" = \"true\" ]; then\n  # Golden Verification must measure a real 443 listener; a self-signed bundle is enough because\n  # the probe asserts reachability through the SG, not certificate trust.\n  openssl req -x509 -newkey rsa:2048 -nodes -days 365 \\\n    -keyout /etc/nginx/tls/corenova-selfsigned.pem \\\n    -out /etc/nginx/tls/corenova-selfsigned.pem \\\n    -subj \"/CN=corenova-canary\" >/dev/null 2>&1\n  chmod 0600 /etc/nginx/tls/corenova-selfsigned.pem\n  TLS_PEM_PATH=/etc/nginx/tls/corenova-selfsigned.pem\nfi\n\n# HTTP 与 HTTPS 使用同一组代理、上传和访问控制指令，避免两条入口漂移。\ninstall -d -m 0755 /etc/nginx/snippets\ncat > /etc/nginx/snippets/corenova-app.conf <<EOF\nallow 127.0.0.1;\nallow ::1;\nallow ${ALLOWED_WEB_CIDR};\ndeny all;\nclient_max_body_size ${MAX_BODY_MB}m;\nclient_body_timeout 300s;\nlocation / {\n  proxy_pass http://corenova_${APP_NAME};\n  proxy_http_version 1.1;\n  proxy_set_header Host \\$http_host;\n  proxy_set_header X-Real-IP \\$remote_addr;\n  proxy_set_header X-Forwarded-For \\$remote_addr;\n  proxy_set_header X-Forwarded-Proto \\$scheme;\n  proxy_set_header Upgrade \\$http_upgrade;\n  proxy_set_header Connection \\$connection_upgrade;\n  proxy_read_timeout 3600s;\n  proxy_send_timeout 3600s;\n  proxy_request_buffering off;\n  proxy_buffering off;\n}\nEOF\n\ncat > /etc/nginx/conf.d/corenova-proxy.conf <<EOF\nmap \\$http_upgrade \\$connection_upgrade { default upgrade; '' close; }\n\nupstream corenova_${APP_NAME} {\n  server 127.0.0.1:${CONTAINER_PORT} max_fails=3 fail_timeout=10s;\n  keepalive 16;\n}\n\nserver {\n  listen 80 default_server;\n  listen [::]:80 default_server;\n  server_name _ ${SERVER_NAMES};\n  access_log /var/log/nginx/corenova-${APP_NAME}.access.log;\n  include /etc/nginx/snippets/corenova-app.conf;\n}\nEOF\n\nif [ -n \"$TLS_PEM_PATH\" ]; then\n  cat >> /etc/nginx/conf.d/corenova-proxy.conf <<EOF\n\nserver {\n  listen 443 ssl default_server;\n  listen [::]:443 ssl default_server;\n  server_name _ ${SERVER_NAMES};\n  ssl_certificate ${TLS_PEM_PATH};\n  ssl_certificate_key ${TLS_PEM_PATH};\n  ssl_protocols TLSv1.2 TLSv1.3;\n  access_log /var/log/nginx/corenova-${APP_NAME}.access.log;\n  include /etc/nginx/snippets/corenova-app.conf;\n}\nEOF\nfi\n\nnginx -t\nsystemctl daemon-reload\nsystemctl enable nginx\nsystemctl restart nginx\necho \"[corenova] nginx serving for ${APP_NAME} on 127.0.0.1:${CONTAINER_PORT}\"\n\n# Logrotate: keep 7 days of platform and nginx logs. The corenova log directory\n# and nginx access log are not covered by any package-provided logrotate rule.\ncat > /etc/logrotate.d/corenova <<EOF\n/var/log/corenova/*.log {\n    daily\n    rotate 7\n    compress\n    missingok\n    notifempty\n    copytruncate\n}\n/var/log/nginx/corenova-*.access.log {\n    daily\n    rotate 7\n    compress\n    missingok\n    notifempty\n    copytruncate\n}\nEOF\n# END SYNCED ASSET 10-nginx-base.sh\n"
               mode: '000755'
               owner: root
               group: root
@@ -404,7 +494,7 @@ Resources:
               owner: root
               group: root
             /opt/corenova/bin/30-app-container.sh:
-              content: "# BEGIN SYNCED ASSET 30-app-container.sh\n#!/bin/bash\n# cfn-init asset: renders the systemd unit that runs the application container.\n# Nothing about the app image or port is baked in - both arrive as CFN parameters, so the same\n# template verifies Ghost today and any other registered app tomorrow.\nset -xeuo pipefail\n\nAPP_NAME=\"${CFNOVA_APP_NAME:?}\"\nIMAGE_REFERENCE=\"${CFNOVA_IMAGE_REFERENCE:?}\"\nCONTAINER_PORT=\"${CFNOVA_CONTAINER_PORT:?}\"\nDATA_DIR=\"${CFNOVA_DATA_DIR:-/var/lib/corenova/app/data}\"\nDATA_MOUNT=\"${CFNOVA_DATA_CONTAINER_PATH:-/data}\"\nAPP_URL=\"${CFNOVA_APP_URL:-}\"\nAPP_URL_ENV_NAME=\"${CFNOVA_APP_URL_ENV_NAME:-}\"\nEXTRA_ENV_FILE=\"${CFNOVA_EXTRA_ENV_FILE:-}\"\nLOG_GROUP=\"${CFNOVA_LOG_GROUP:-/corenova/apps}\"\nAWS_REGION=\"${CFNOVA_AWS_REGION:-us-east-1}\"\nENV_FILE=\"/opt/corenova/env/${APP_NAME}.env\"\n\n# LaunchUrl is optional because the instance public DNS name only exists after launch.\n# Resolve it through IMDSv2 so apps such as Ghost receive a correct absolute base URL.\nif [ -z \"$APP_URL\" ]; then\n  set +x\n  IMDS_TOKEN=\"$(curl -fsS -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token || true)\"\n  if [ -n \"$IMDS_TOKEN\" ]; then\n    PUBLIC_DNS=\"$(curl -fsS -H \"X-aws-ec2-metadata-token: ${IMDS_TOKEN}\" http://169.254.169.254/latest/meta-data/public-hostname || true)\"\n    if [ -n \"$PUBLIC_DNS\" ]; then\n      APP_URL=\"http://${PUBLIC_DNS}\"\n    fi\n  fi\n  set -x\nfi\n\ninstall -d -m 0755 \"$DATA_DIR\"\nmkdir -p /opt/corenova/env\n\ncat > \"$ENV_FILE\" <<EOF\nCORENOVA_APP_IMAGE=${IMAGE_REFERENCE}\nCORENOVA_CONTAINER_PORT=${CONTAINER_PORT}\nCORENOVA_DATA_DIR=${DATA_DIR}\nCORENOVA_APP_URL=${APP_URL}\nEOF\nif [ -n \"$APP_URL_ENV_NAME\" ] && [ -n \"$APP_URL\" ]; then\n  printf '%s=%s\\n' \"$APP_URL_ENV_NAME\" \"$APP_URL\" >> \"$ENV_FILE\"\nfi\nif [ -n \"$EXTRA_ENV_FILE\" ] && [ -s \"$EXTRA_ENV_FILE\" ]; then\n  cat \"$EXTRA_ENV_FILE\" >> \"$ENV_FILE\"\nfi\nchown root:corenova \"$ENV_FILE\"\nchmod 0640 \"$ENV_FILE\"\n\ncat > \"/etc/systemd/system/corenova-${APP_NAME}.service\" <<EOF\n[Unit]\nDescription=CoreNova application container (${APP_NAME})\nAfter=docker.service network-online.target\nRequires=docker.service\n\n[Service]\nType=simple\nRestart=always\nRestartSec=5\nEnvironmentFile=${ENV_FILE}\nExecStartPre=-/usr/bin/docker rm -f ${APP_NAME}\nExecStartPre=/usr/bin/docker pull ${IMAGE_REFERENCE}\nExecStart=/usr/bin/docker run --rm --name ${APP_NAME} \\\\\n  --label corenova.app=${APP_NAME} \\\\\n  --log-driver awslogs --log-opt awslogs-group=${LOG_GROUP} --log-opt awslogs-stream=${APP_NAME} --log-opt awslogs-region=${AWS_REGION} \\\\\n  --stop-timeout 30 \\\\\n  -p 127.0.0.1:${CONTAINER_PORT}:${CONTAINER_PORT} \\\\\n  -v ${DATA_DIR}:${DATA_MOUNT} \\\\\n  --env-file ${ENV_FILE} \\\\\n  ${IMAGE_REFERENCE}\nExecStop=/usr/bin/docker stop ${APP_NAME}\n\n[Install]\nWantedBy=multi-user.target\nEOF\n\nsystemctl daemon-reload\nsystemctl enable \"corenova-${APP_NAME}\"\nsystemctl restart \"corenova-${APP_NAME}\"\nsleep 5\nsystemctl is-active \"corenova-${APP_NAME}\"\ndocker ps --filter \"name=^/${APP_NAME}$\" --format '{{.Names}} {{.Status}}'\n# END SYNCED ASSET 30-app-container.sh\n"
+              content: "# BEGIN SYNCED ASSET 30-app-container.sh\n#!/bin/bash\n# cfn-init asset: renders the systemd unit that runs the application container.\n# Nothing about the app image or port is baked in - both arrive as CFN parameters, so the same\n# template verifies Ghost today and any other registered app tomorrow.\nset -xeuo pipefail\n\nAPP_NAME=\"${CFNOVA_APP_NAME:?}\"\nIMAGE_REFERENCE=\"${CFNOVA_IMAGE_REFERENCE:?}\"\nCONTAINER_PORT=\"${CFNOVA_CONTAINER_PORT:?}\"\nDATA_DIR=\"${CFNOVA_DATA_DIR:-/var/lib/corenova/app/data}\"\nDATA_MOUNT=\"${CFNOVA_DATA_CONTAINER_PATH:-/data}\"\nAPP_URL=\"${CFNOVA_APP_URL:-}\"\nAPP_URL_ENV_NAME=\"${CFNOVA_APP_URL_ENV_NAME:-}\"\nEXTRA_ENV_FILE=\"${CFNOVA_EXTRA_ENV_FILE:-}\"\nLOG_GROUP=\"${CFNOVA_LOG_GROUP:-/corenova/apps}\"\nAWS_REGION=\"${CFNOVA_AWS_REGION:-us-east-1}\"\nENV_FILE=\"/opt/corenova/env/${APP_NAME}.env\"\nDOCKER_SOCKET_ACCESS=\"${CFNOVA_DOCKER_SOCKET_ACCESS:-false}\"\nEXTRA_TCP_PORT=\"${CFNOVA_EXTRA_TCP_PORT:-0}\"\nEXTRA_UDP_PORT=\"${CFNOVA_EXTRA_UDP_PORT:-0}\"\n\n# 仅允许结构化选项，禁止向 systemd 注入任意 Docker 参数。\nEXTRA_ARGS=\"\"\ncase \"$DOCKER_SOCKET_ACCESS\" in\n  true)\n    [ -S /var/run/docker.sock ] || { echo '[corenova] Docker socket 不存在'; exit 1; }\n    EXTRA_ARGS=\"--mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock\"\n    ;;\n  false) ;;\n  *) exit 1 ;;\nesac\nfor protocol in tcp udp; do\n  if [ \"$protocol\" = tcp ]; then port=\"$EXTRA_TCP_PORT\"; else port=\"$EXTRA_UDP_PORT\"; fi\n  [[ \"$port\" =~ ^(0|[1-9][0-9]{0,4})$ ]] || exit 1\n  if [ \"$port\" != 0 ]; then\n    # 禁止绕过管理入口代理，也不得占用 SSH/HTTP(S)。\n    if (( port > 65535 || port < 1024 || port == CONTAINER_PORT )); then\n      echo '[corenova] 额外端口必须为独立的非特权业务端口'; exit 1\n    fi\n    EXTRA_ARGS=\"$EXTRA_ARGS -p 0.0.0.0:${port}:${port}/${protocol}\"\n  fi\ndone\n\n# LaunchUrl is optional because the instance public DNS name only exists after launch.\n# Resolve it through IMDSv2 so apps such as Ghost receive a correct absolute base URL.\nif [ -z \"$APP_URL\" ]; then\n  set +x\n  IMDS_TOKEN=\"$(curl -fsS --connect-timeout 2 --max-time 5 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token || true)\"\n  if [ -n \"$IMDS_TOKEN\" ]; then\n    PUBLIC_DNS=\"$(curl -fsS --connect-timeout 2 --max-time 5 -H \"X-aws-ec2-metadata-token: ${IMDS_TOKEN}\" http://169.254.169.254/latest/meta-data/public-hostname || true)\"\n    if [ -n \"$PUBLIC_DNS\" ]; then\n      APP_URL=\"http://${PUBLIC_DNS}\"\n    fi\n  fi\n  set -x\nfi\n\n# 规范化根 URL，追加环境变量中的 / 不会生成双斜杠。\nAPP_URL=\"${APP_URL%/}\"\nif [ -n \"$APP_URL_ENV_NAME\" ]; then\n  [[ \"$APP_URL_ENV_NAME\" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || exit 1\n  [ -n \"$APP_URL\" ] || { echo '[corenova] 无法解析应用 URL'; exit 1; }\nfi\n\n# 已有目录不重设 mode，不递归修改已有数据。\n[ -d \"$DATA_DIR\" ] || install -d -m 0755 \"$DATA_DIR\"\ndocker pull \"$IMAGE_REFERENCE\"\nIMAGE_USER=\"$(docker image inspect --format '{{.Config.User}}' \"$IMAGE_REFERENCE\")\"\nif [ -n \"$IMAGE_USER\" ] && [ \"$IMAGE_USER\" != root ] && [ \"$IMAGE_USER\" != 0 ]; then\n  # Run only id, without network, writable rootfs, host mounts or application entrypoint.\n  if [[ \"$IMAGE_USER\" =~ ^([0-9]+):([0-9]+)$ ]]; then\n    DATA_UID=\"${BASH_REMATCH[1]}\"\n    DATA_GID=\"${BASH_REMATCH[2]}\"\n  elif [[ \"$IMAGE_USER\" =~ ^[0-9]+$ ]]; then\n    # distroless 镜像可能没有 id；数字 UID 已足以保证 owner 可写，不猜测组号。\n    DATA_UID=\"$IMAGE_USER\"\n    DATA_GID=\"\"\n  else\n    DATA_UID=\"$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --entrypoint id \"$IMAGE_REFERENCE\" -u)\"\n    DATA_GID=\"$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --entrypoint id \"$IMAGE_REFERENCE\" -g)\"\n  fi\n  [[ \"$DATA_UID\" =~ ^[0-9]+$ && \"$DATA_GID\" =~ ^[0-9]*$ ]] || exit 1\n  DATA_OWNER=\"${DATA_UID}${DATA_GID:+:$DATA_GID}\"\n  OWNER_FORMAT='%u'\n  [ -z \"$DATA_GID\" ] || OWNER_FORMAT='%u:%g'\n  # 新 ext4 卷自带 lost+found；它不是应用数据，不能导致首次部署被拒。\n  if [ -z \"$(find \"$DATA_DIR\" -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit)\" ]; then\n    chown \"$DATA_OWNER\" \"$DATA_DIR\"\n  elif [ \"$(stat -c \"$OWNER_FORMAT\" \"$DATA_DIR\")\" != \"$DATA_OWNER\" ]; then\n    echo '[corenova] existing data ownership requires operator review; refusing recursive chown'\n    exit 1\n  fi\nfi\nmkdir -p /opt/corenova/env\n\ncat > \"$ENV_FILE\" <<EOF\nCORENOVA_APP_IMAGE=${IMAGE_REFERENCE}\nCORENOVA_CONTAINER_PORT=${CONTAINER_PORT}\nCORENOVA_DATA_DIR=${DATA_DIR}\nCORENOVA_APP_URL=${APP_URL}\nEOF\nif [ -n \"$EXTRA_ENV_FILE\" ] && [ -s \"$EXTRA_ENV_FILE\" ]; then\n  # Expand only the supported URL placeholder; never eval arbitrary config.\n  while IFS= read -r line || [ -n \"$line\" ]; do\n    case \"$line\" in ''|'#'*) continue ;; esac\n    [[ \"$line\" =~ ^[A-Za-z_][A-Za-z0-9_]*=.+$ && \"$line\" != *$'\\r'* ]] || {\n      echo '[corenova] 环境变量必须为单行 KEY=VALUE'; exit 1;\n    }\n    if [[ \"$line\" == *'${CORENOVA_APP_URL}'* ]] && [ -z \"$APP_URL\" ]; then\n      echo '[corenova] 无法解析应用 URL'; exit 1\n    fi\n    line=\"${line//\\$\\{CORENOVA_APP_URL\\}/$APP_URL}\"\n    if [[ \"$line\" == *'${'* ]]; then\n      echo '[corenova] unsupported environment placeholder'; exit 1\n    fi\n    # 原生 URL 字段优先，兼容旧 Manifest 中重复的 URL 行。\n    [ \"${line%%=*}\" = \"$APP_URL_ENV_NAME\" ] && continue\n    printf '%s\\n' \"$line\" >> \"$ENV_FILE\"\n  done < \"$EXTRA_ENV_FILE\"\nfi\nif [ -n \"$APP_URL_ENV_NAME\" ]; then\n  printf '%s=%s\\n' \"$APP_URL_ENV_NAME\" \"$APP_URL\" >> \"$ENV_FILE\"\nfi\nchown root:corenova-app \"$ENV_FILE\"\nchmod 0640 \"$ENV_FILE\"\n\ncat > \"/etc/systemd/system/corenova-${APP_NAME}.service\" <<EOF\n[Unit]\nDescription=CoreNova application container (${APP_NAME})\nAfter=docker.service network-online.target\nRequires=docker.service\n\n[Service]\nType=simple\nRestart=always\nRestartSec=5\nExecStartPre=-/usr/bin/docker rm -f ${APP_NAME}\nExecStartPre=/usr/bin/docker pull ${IMAGE_REFERENCE}\nExecStart=/usr/bin/docker run --rm --name ${APP_NAME} \\\\\n  --label corenova.app=${APP_NAME} \\\\\n  --log-driver awslogs --log-opt awslogs-group=${LOG_GROUP} --log-opt awslogs-stream=${APP_NAME} --log-opt awslogs-region=${AWS_REGION} \\\\\n  --stop-timeout 30 \\\\\n  -p 127.0.0.1:${CONTAINER_PORT}:${CONTAINER_PORT} \\\\\n  -v ${DATA_DIR}:${DATA_MOUNT} \\\\\n  --env-file ${ENV_FILE} \\\\\n  ${EXTRA_ARGS} \\\\\n  ${IMAGE_REFERENCE}\nExecStop=/usr/bin/docker stop ${APP_NAME}\n\n[Install]\nWantedBy=multi-user.target\nEOF\n\nsystemctl daemon-reload\nsystemctl enable \"corenova-${APP_NAME}\"\nsystemctl restart \"corenova-${APP_NAME}\"\nsleep 5\nsystemctl is-active \"corenova-${APP_NAME}\"\ndocker ps --filter \"name=^/${APP_NAME}$\" --format '{{.Names}} {{.Status}}'\n# END SYNCED ASSET 30-app-container.sh\n"
               mode: '000755'
               owner: root
               group: root

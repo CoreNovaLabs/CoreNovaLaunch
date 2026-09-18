@@ -67,15 +67,15 @@ deployment:
       en: "First visit opens the admin account creation page: follow the on-screen form to set up the admin account (username fixed to 'admin'). No preset access."
       zh: "首次访问进入管理员创建页面：按页面向导完成 admin 账户的初始设置（用户名固定为 admin）；没有预置账号。"
     notes:
-      - en: "Portainer needs the host Docker socket (/var/run/docker.sock) mounted to manage containers; the CFN template provides it."
-        zh: "Portainer 需要挂载宿主机 Docker socket（/var/run/docker.sock）才能管理容器；CFN 模板已提供。"
+      - en: "The default deployment does not mount the host Docker socket. To manage this host, explicitly enable DockerSocketAccess in CloudFormation; this grants host-root-equivalent control. Keep AllowedWebCidr restricted, complete admin setup through SSM forwarding, and configure HTTPS before remote access. Remote environments require separate setup."
+        zh: "默认部署不挂载宿主机 Docker socket。管理本机需在 CloudFormation 显式启用 DockerSocketAccess，这相当于授予宿主机 root 控制权。保持 AllowedWebCidr 受限，通过 SSM 转发完成管理员初始化，并在远程访问前配置 HTTPS。远程环境需要另行接入。"
       - en: "Data lives on a retained volume (/data). It keeps billing after stack deletion; snapshot it, then delete the volume when no longer needed."
         zh: "数据保存在保留数据卷（/data）中。删除栈后该卷仍会计费；请先创建快照，不再需要时再删除卷。"
   cost_estimate:
-    monthly_usd: 16
+    monthly_usd: 23
     note:
-      en: "Verified default in us-east-1: ~$15.2 t3.small + ~$0.8 for the 8 GB root volume per month. No separate data volume is required."
-      zh: "us-east-1 已验证默认配置：t3.small 约 $15.2/月 + 8GB 系统盘约 $0.8/月；无需独立数据盘。"
+      en: "Default estimate in us-east-1: t3.small, 20 GB root plus 30 GB data gp3, and public IPv4; transfer and snapshots are extra."
+      zh: "us-east-1 默认估算：t3.small、20GB 系统盘、30GB 数据盘与公网 IPv4；流量和快照另计。"
   data_path: "/data"
 
 website:

@@ -229,6 +229,18 @@ def test_rule15_override_needs_reason(tmp_path):
     assert any("规则15" in e for e in errors(tmp_path, m))
 
 
+@pytest.mark.parametrize("value", ["A=x\nB=y", "A=x\rB=y", "A=${UNKNOWN}", "A=${BROKEN"])
+def test_rule16_rejects_multiline_and_unknown_placeholders(tmp_path, value):
+    errs = errors(tmp_path, lambda d: d["deploy"].__setitem__("extra_environment", [value]))
+    assert any("规则16" in e for e in errs)
+
+
+def test_rule16_accepts_resolved_url_placeholder(tmp_path):
+    assert errors(tmp_path, lambda d: d["deploy"].__setitem__(
+        "extra_environment", ["PUBLIC_URL=${CORENOVA_APP_URL}/"]
+    )) == []
+
+
 def test_rule17_admin_path_without_setup_rejected(tmp_path):
     def m(d):
         d["deployment"]["post_deploy"] = {"admin_path": "/ghost/"}

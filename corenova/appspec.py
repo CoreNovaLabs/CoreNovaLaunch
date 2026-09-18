@@ -130,6 +130,9 @@ def validate(spec: AppSpec, root: Path, platform_region: str) -> list[str]:
     e: list[str] = []
     g = spec.g
 
+    if g("schema_version", 1) != 1 or g("deploy.services") is not None:
+        return ["多容器 v2 尚未接入生产发布门禁；请使用实验性 stack 编译器，不得经 v1 发布"]
+
     # 1 文件名 == app.name
     if g("app.name") != spec.name:
         e.append(f"规则1: app.name={g('app.name')!r} 必须等于文件名 {spec.name!r}")
@@ -295,10 +298,12 @@ def validate(spec: AppSpec, root: Path, platform_region: str) -> list[str]:
     else:
         for i, item in enumerate(extra_env):
             s = str(item)
-            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.+$", s):
-                e.append(f"规则16: extra_environment[{i}] 必须为 KEY=VALUE 形式：{s!r}")
+            if not isinstance(item, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=[^\r\n]+", s):
+                e.append(f"规则16: extra_environment[{i}] 必须为单行 KEY=VALUE 形式：{s!r}")
             elif re.search(r"secret|password|token|private_key", s, re.I):
                 e.append(f"规则16: extra_environment[{i}] 含敏感词，敏感值走 SSM/Secrets，不进 app schema")
+            if "${" in s.replace("${CORENOVA_APP_URL}", ""):
+                e.append(f"规则16: extra_environment[{i}] 仅支持 ${{CORENOVA_APP_URL}} 占位符")
 
     # 17 post_deploy：部署后指引（网站详情页渲染）。只写"去哪/怎么获取"，凭据不进契约
     pd = g("deployment.post_deploy")

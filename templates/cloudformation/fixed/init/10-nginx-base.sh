@@ -9,6 +9,12 @@ CONTAINER_PORT="${CFNOVA_CONTAINER_PORT:?}"
 SERVER_NAMES="${CFNOVA_SERVER_NAMES:-}"
 TLS_PEM_PATH="${CFNOVA_TLS_PEM_PATH:-}"
 SELF_SIGNED_TLS="${CFNOVA_SELF_SIGNED_TLS:-false}"
+ALLOWED_WEB_CIDR="${CFNOVA_ALLOWED_WEB_CIDR:-127.0.0.1/32}"
+MAX_BODY_MB="${CFNOVA_MAX_BODY_MB:-100}"
+
+# 默认仅允许 SSM 转发后的本机访问；不信任客户端提供的转发地址。
+python3 -c 'import ipaddress, sys; ipaddress.IPv4Network(sys.argv[1], strict=False)' "$ALLOWED_WEB_CIDR"
+[[ "$MAX_BODY_MB" =~ ^[1-9][0-9]{0,4}$ ]] && (( MAX_BODY_MB <= 10240 )) || exit 1
 
 install -d -m 0755 /etc/nginx/tls /var/log/nginx
 DEBIAN_FRONTEND=noninteractive apt-get install -y nginx logrotate || {
@@ -34,6 +40,31 @@ if [ -z "$TLS_PEM_PATH" ] && [ "$SELF_SIGNED_TLS" = "true" ]; then
   TLS_PEM_PATH=/etc/nginx/tls/corenova-selfsigned.pem
 fi
 
+# HTTP 与 HTTPS 使用同一组代理、上传和访问控制指令，避免两条入口漂移。
+install -d -m 0755 /etc/nginx/snippets
+cat > /etc/nginx/snippets/corenova-app.conf <<EOF
+allow 127.0.0.1;
+allow ::1;
+allow ${ALLOWED_WEB_CIDR};
+deny all;
+client_max_body_size ${MAX_BODY_MB}m;
+client_body_timeout 300s;
+location / {
+  proxy_pass http://corenova_${APP_NAME};
+  proxy_http_version 1.1;
+  proxy_set_header Host \$http_host;
+  proxy_set_header X-Real-IP \$remote_addr;
+  proxy_set_header X-Forwarded-For \$remote_addr;
+  proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Upgrade \$http_upgrade;
+  proxy_set_header Connection \$connection_upgrade;
+  proxy_read_timeout 3600s;
+  proxy_send_timeout 3600s;
+  proxy_request_buffering off;
+  proxy_buffering off;
+}
+EOF
+
 cat > /etc/nginx/conf.d/corenova-proxy.conf <<EOF
 map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
 
@@ -46,25 +77,8 @@ server {
   listen 80 default_server;
   listen [::]:80 default_server;
   server_name _ ${SERVER_NAMES};
-
   access_log /var/log/nginx/corenova-${APP_NAME}.access.log;
-
-  location = /corenova-health {
-    access_log off;
-    proxy_pass http://corenova_${APP_NAME};
-  }
-
-  location / {
-    proxy_pass http://corenova_${APP_NAME};
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection \$connection_upgrade;
-    proxy_read_timeout 90s;
-  }
+  include /etc/nginx/snippets/corenova-app.conf;
 }
 EOF
 
@@ -78,12 +92,8 @@ server {
   ssl_certificate ${TLS_PEM_PATH};
   ssl_certificate_key ${TLS_PEM_PATH};
   ssl_protocols TLSv1.2 TLSv1.3;
-  location / {
-    proxy_pass http://corenova_${APP_NAME};
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-  }
+  access_log /var/log/nginx/corenova-${APP_NAME}.access.log;
+  include /etc/nginx/snippets/corenova-app.conf;
 }
 EOF
 fi

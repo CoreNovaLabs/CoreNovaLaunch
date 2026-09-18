@@ -33,6 +33,7 @@ deploy:
   compose_file: "apps/vikunja/docker-compose.yml"
   extra_environment:
     - "VIKUNJA_SERVICE_PUBLICURL=${CORENOVA_APP_URL}/"
+    - "VIKUNJA_FILES_BASEPATH=/db"
 
 health_check:
   # /api/v1/info 免鉴权，200 JSON（实测 vikunja/vikunja:2.6.0）
@@ -69,6 +70,8 @@ deployment:
       en: "The first registered account becomes the instance admin. There are no preset credentials."
       zh: "注册的第一个账户即实例管理员；没有预置账号密码。"
     notes:
+      - en: "SQLite and attachments share /db without changing the database engine. Before updating an existing deployment, back up the database and export attachments from /app/vikunja/files; restore and verify them on a copy before switching. Replacing the template does not migrate container-local files."
+        zh: "SQLite 与附件共用 /db，不更换数据库引擎。更新已有部署前，先备份数据库并导出 /app/vikunja/files 中的附件，在副本上恢复验证后再切换；更换模板不会迁移容器内文件。"
       - en: "Database (SQLite) and attachments live on a retained volume (/db). It keeps billing after stack deletion; snapshot it, then delete the volume when no longer needed."
         zh: "数据库（SQLite）与附件保存在保留数据卷（/db）中。删除栈后该卷仍会计费；请先创建快照，不再需要时再删除卷。"
   cost_estimate:

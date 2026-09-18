@@ -64,13 +64,13 @@ deployment:
   post_deploy:
     admin_path: "/"
     admin_setup:
-      en: "The web GUI is open at / for local use; before exposing it publicly, configure GUI access protection per the upstream docs (Settings > GUI). There are no preset accounts."
-      zh: "Web 管理界面在 / 开放（本地访问免认证）；对外公开前请按上游文档在设置 > GUI 中完成访问保护配置。没有预置账号。"
+      en: "The template restricts the GUI to localhost by default. Use SSM port forwarding to configure GUI access protection in Settings > GUI before widening AllowedWebCidr, and enable HTTPS for direct remote access. There are no preset accounts."
+      zh: "模板默认仅允许本机访问 GUI。通过 SSM 端口转发进入设置 > GUI 完成访问保护后，再扩大 AllowedWebCidr；远程直连还需启用 HTTPS。没有预置账号。"
     notes:
       - en: "Sync folders live on a retained volume (/var/syncthing). It keeps billing after stack deletion; snapshot it, then delete the volume when no longer needed."
         zh: "同步文件夹保存在保留数据卷（/var/syncthing）中。删除栈后该卷仍会计费；请先创建快照，不再需要时再删除卷。"
-      - en: "Default container ports 22000/tcp+udp and 21027/udp are used for device sync (LAN discovery); the CFN security group opens 22000 for cross-device sync."
-        zh: "容器默认的 22000/tcp+udp 与 21027/udp 用于设备间同步（局域网发现）；CFN 安全组已放行 22000 以支持跨设备同步。"
+      - en: "Direct device sync is opt-in: set ExtraTcpPort=22000, ExtraUdpPort=22000 and ExtraPortIngressCidr to the peer range. This publishes both Docker ports and adds matching security-group rules. GUI port 8384 stays loopback-only. UDP 21027 LAN discovery is not exposed; configure peer addresses or use upstream discovery/relay."
+        zh: "设备直连同步需显式设置 ExtraTcpPort=22000、ExtraUdpPort=22000，并将 ExtraPortIngressCidr 设为对端网段；模板同时发布 Docker 端口并添加对应安全组规则。GUI 的 8384 仍仅绑定本机。不会暴露 UDP 21027 局域网发现，请配置对端地址或使用上游发现/中继。"
   cost_estimate:
     monthly_usd: 23
     note:

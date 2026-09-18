@@ -100,6 +100,7 @@ CANARY_PRESETS: dict[str, str] = {
     "DataDirHostPath": "/var/lib/corenova/canary/data",
     "CloudWatchLogGroupName": "/corenova/canary",
     "SelfSignedTls": "true",
+    "AllowedWebCidr": "0.0.0.0/0",
     "TerminationProtection": "Disabled",
 }
 CANARY_DESCRIPTION = (

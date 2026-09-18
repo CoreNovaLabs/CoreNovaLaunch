@@ -63,11 +63,11 @@ deployment:
   post_deploy:
     admin_path: "/"
     admin_setup:
-      en: "The dashboard is open at / for local use without sign-in; for remote management, create a Netdata Cloud space or configure claiming per the upstream docs."
-      zh: "仪表盘在 / 直接开放（本地访问免登录）；远程纳管请创建 Netdata Cloud 空间或按上游文档完成接入配置。"
+      en: "The agent dashboard has no local sign-in. The template restricts Web access to localhost by default; use SSM port forwarding. Configure an authenticated HTTPS gateway before widening AllowedWebCidr. Claiming in Netdata Cloud does not protect the local endpoint."
+      zh: "Agent 仪表盘无本地登录认证。模板默认仅允许本机 Web 访问，请使用 SSM 端口转发。扩大 AllowedWebCidr 前须配置带认证的 HTTPS 网关；接入 Netdata Cloud 并不能保护本地入口。"
     notes:
-      - en: "Netdata runs as a container agent: it sees host metrics only for the namespaces/cgroups mounted in; the CFN template mounts the standard /proc, /sys and cgroup paths."
-        zh: "Netdata 以容器形态运行，只能采集已挂载 namespace/cgroup 的主机指标；CFN 模板已挂载标准 /proc、/sys 与 cgroup 路径。"
+      - en: "This deployment verifies the container agent only. It does not mount host /proc, /sys, cgroups or Docker socket, and does not grant host PID or elevated capabilities. Full host monitoring needs a separately assessed configuration and is not verified here."
+        zh: "当前部署仅验证容器 Agent，不挂载宿主机 /proc、/sys、cgroup 或 Docker socket，也不授予宿主机 PID 或额外能力。完整宿主机监控需要单独评估配置，不在本次验证范围内。"
       - en: "Time-series live in-container by default; metrics history is not persisted to the retained volume unless configured."
         zh: "默认时序数据保存在容器内；除非另行配置，指标历史不持久化到保留数据卷。"
   cost_estimate:
@@ -82,9 +82,9 @@ website:
   screenshots_order: ["dashboard"]
   tags: ["monitoring", "metrics", "observability"]
   features:
-    - en: "Per-second metrics for CPU, memory, disk, network and apps"
-      zh: "CPU、内存、磁盘、网络与应用的秒级指标"
-    - en: "Zero-configuration auto-detection of services"
-      zh: "零配置自动发现服务与指标"
+    - en: "Per-second metrics visible within the container agent"
+      zh: "容器 Agent 可见范围内的秒级指标"
+    - en: "Host-wide monitoring requires a separately assessed deployment"
+      zh: "完整主机监控需要单独评估部署配置"
     - en: "Built-in anomaly detection and alerting"
       zh: "内置异常检测与告警"
