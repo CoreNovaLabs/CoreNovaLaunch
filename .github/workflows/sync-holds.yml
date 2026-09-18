@@ -70,6 +70,24 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
+      # 诊断：先证明“能读到真实对象”，再跑同步；避免把连接/桶配置问题静默吞成 absent
+      - name: Preflight - read published index.json
+        run: |
+          python - <<'PY'
+          from corenova.backend import make_backend
+          from corenova.config import Config
+
+          cfg = Config.load()
+          backend = make_backend(cfg)
+          raw, etag = backend.get_with_etag("verified/index.json")
+          if not raw:
+              raise SystemExit(
+                  "preflight 失败：verified/index.json 不可读 "
+                  f"(bucket={cfg.r2_bucket!r}, endpoint={cfg.r2_endpoint!r})"
+              )
+          print(f"preflight ok: index.json {len(raw)} bytes, etag={etag}")
+          PY
+
       - name: Sync holds -> current.json
         env:
           APPS: ${{ github.event.inputs.apps }}
