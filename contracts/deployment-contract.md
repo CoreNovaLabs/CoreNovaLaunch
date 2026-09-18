@@ -1,7 +1,7 @@
 # Contract · Deployment Contract（网站数据契约）
 
 > 优先级：**最高**。
-> 术语：本文沿用 Repo A / Repo B / Repo C 代号，分别指 `CoreNovaLaunchWebsite`（官网，本地目录 `website/`）、`CoreNovaLaunchAmi`（AMI 构建，引导期未落地）、`CoreNovaLaunchVerify`（验证枢纽）。
+> 术语：本文沿用 Repo A / Repo B / Repo C 代号，分别指 `CoreNovaLaunchWebsite`（官网，本地目录 `website/`）、`CoreNovaLaunchAmi`（AMI 构建，引导期未落地）、`CoreNovaLaunch`（验证枢纽）。
 > 适用：Repo A `CoreNovaLaunchWebsite` 构建时消费的运行时数据。
 > 本文规定"网站只能从 Manifest 拿什么、不能自己猜什么"。任何设计文档与之冲突，以本文为准。
 
@@ -47,7 +47,7 @@ R2 = Website Runtime Source of Truth
   "status": "verified",
   "verified_at": "2026-08-27T10:00:00Z",
   "report_url": "https://<r2-public>/reports/ghost-v5.75.0-20260827-001.html",
-  "workflow_run_url": "https://github.com/<org>/CoreNovaLaunchVerify/actions/runs/123456",
+  "workflow_run_url": "https://github.com/<org>/CoreNovaLaunch/actions/runs/123456",
   "screenshots_order": ["home", "admin"],
 
   "deploy": {
@@ -147,10 +147,14 @@ Manifest: https://pub-xxxx.r2.dev/screenshots/ghost/v5.75.0/home.png
 - 模板 URL 是**基础设施配置**而非验证证据 -> **不进** `current.json` / Manifest；Repo A 以构建期常量引用
   （`src/lib/deploy.ts`，`VITE_ONE_CLICK_TEMPLATE_URL` 可覆盖），默认值必须与 Repo C `TEMPLATE_S3_BUCKET`
   指向同一只桶（repo-structure.md §4.4）。
-- 深链必须把当前记录的 `ami_id`、`deploy.instance_type`、`deploy.data_volume_gb`、
+- 默认深链必须把当前记录的 `ami_id`、`deploy.instance_type`、`deploy.data_volume_gb`、
   `deploy.data_path`、`deploy.health_check_path`、`deploy.app_url_env_name` 与 digest-pinned
   `deploy.docker_image` 完整映射到 CloudFormation 参数。缺任一强制值时 Deploy 按钮必须禁用并提示
   “需要重新验证”，不得退回模板默认值后仍称为已验证部署。
+- 详情页允许用户在该基线上**主动上调** `InstanceType` 和 `DataVolumeSize`，但不得下调：实例仅显示
+  当前 t3 档及更高档，数据卷仅显示当前值及其 2× / 4×（且不超过模板上限 4096 GB）。一旦修改，
+  界面必须明确标为“自定义配置 / 未单独验证”，不得继续显示该组合已验证，也不得沿用默认配置的
+  成本估算；镜像 digest、AMI、数据路径、端口与健康检查仍必须来自所选版本的 Manifest 并保持钉扎。
 
 ## 3. 字段来源约束（禁止前端猜测）
 
