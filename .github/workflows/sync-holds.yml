@@ -74,6 +74,8 @@ jobs:
       - name: Preflight - read published index.json
         run: |
           python - <<'PY'
+          import boto3
+
           from corenova.backend import make_backend
           from corenova.config import Config
 
@@ -81,9 +83,33 @@ jobs:
           backend = make_backend(cfg)
           raw, etag = backend.get_with_etag("verified/index.json")
           if not raw:
+              # 深挖：桶可达性 + 凭据可见桶清单（桶名配置错误在此显形）
+              s3 = boto3.client(
+                  "s3",
+                  endpoint_url=cfg.r2_endpoint,
+                  aws_access_key_id=__import__("os").environ["R2_ACCESS_KEY_ID"],
+                  aws_secret_access_key=__import__("os").environ["R2_SECRET_ACCESS_KEY"],
+                  region_name="auto",
+              )
+              try:
+                  s3.head_bucket(Bucket=cfg.r2_bucket)
+                  print(f"head_bucket ok: bucket exists (name masked)")
+                  resp = s3.list_objects_v2(Bucket=cfg.r2_bucket, Prefix="verified/", MaxKeys=5)
+                  print("list verified/: KeyCount =", resp.get("KeyCount"))
+                  for obj in resp.get("Contents", [])[:5]:
+                      print(" -", obj["Key"])
+              except Exception as exc:
+                  print("head_bucket failed:", type(exc).__name__, exc)
+                  try:
+                      visible = s3.list_buckets()
+                      names = [b["Name"] for b in visible.get("Buckets", [])]
+                      print("credentials can see buckets:", names)
+                      print("-> 若清单里没有目标桶，说明 secret 值或账号不对；若有，说明桶内无 verified/ 前缀")
+                  except Exception as exc2:
+                      print("list_buckets failed:", type(exc2).__name__, exc2)
               raise SystemExit(
                   "preflight 失败：verified/index.json 不可读 "
-                  f"(bucket={cfg.r2_bucket!r}, endpoint={cfg.r2_endpoint!r})"
+                  f"(endpoint={cfg.r2_endpoint!r}, backend={backend.name})"
               )
           print(f"preflight ok: index.json {len(raw)} bytes, etag={etag}")
           PY
