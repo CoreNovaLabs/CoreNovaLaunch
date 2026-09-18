@@ -202,7 +202,11 @@ def assert_version(
     actual = ""
     try:
         if kind == "exec_command":
-            proc = run(["docker", "exec", cid, "sh", "-c", va["command"]], check=False, timeout=90)
+            command = va["command"]
+            argv = ["sh", "-c", command] if isinstance(command, str) else command
+            if not isinstance(argv, list) or not argv or not all(isinstance(x, str) and x.strip() for x in argv):
+                return Assertion(True, False, "", expected, "command 必须是命令字符串或非空字符串参数列表")
+            proc = run(["docker", "exec", cid, *argv], check=False, timeout=90)
             actual = (proc.stdout or "").strip().splitlines()[-1] if (proc.stdout or "").strip() else ""
             if proc.returncode != 0:
                 return Assertion(True, False, "", expected, f"命令失败({proc.returncode}): {proc.stderr.strip()[:200]}")

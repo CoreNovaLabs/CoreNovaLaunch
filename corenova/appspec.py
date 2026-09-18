@@ -255,6 +255,13 @@ def validate(spec: AppSpec, root: Path, platform_region: str) -> list[str]:
                 for r in required:
                     if not va.get(r):
                         e.append(f"规则12: version_assertion.kind={kind} 缺字段 {r}")
+            if kind == "exec_command":
+                command = va.get("command")
+                valid_command = isinstance(command, str) and bool(command.strip())
+                valid_argv = (isinstance(command, list) and bool(command)
+                              and all(isinstance(x, str) and bool(x.strip()) for x in command))
+                if not (valid_command or valid_argv):
+                    e.append("规则12: exec_command.command 必须是非空字符串或非空字符串参数列表")
             expected = str(va.get("expected", ""))
             if not expected:
                 e.append("规则12: version_assertion.expected 必填")

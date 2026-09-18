@@ -238,7 +238,7 @@ health_check:
 | `label` | 镜像 OCI label（`org.opencontainers.image.version`） | 上游规范打包 |
 | `api_json_path` | `GET {baseURL}{path}` 后按 JSON Pointer 取值 | 应用暴露 `/version` 类端点 |
 | `header` | 健康探测响应的 HTTP 头 | Ghost `x-ghost-version`（用 `match: prefix`） |
-| `exec_command` | `docker exec` 内跑命令取 stdout | 读 `package.json` / `--version` |
+| `exec_command` | `docker exec` 内跑命令取 stdout；`command` 为字符串时通过 `sh -c` 执行，为非空字符串列表时直接按 argv 执行（不展开 shell） | 读 `package.json` / `--version`；scratch 镜像可用 `command: ["/bin/dufs", "--version"]` |
 
 - `expected` 支持 §3.1 同一组占位符；`match: prefix` 仅允许用于"上游自报版本粒度更粗"（如只报 `5.75`）的场景，且必须在 yaml 注释说明粒度来源。
 - 断言失败 → 分类 `APPLICATION`（镜像与版本不符）**不得自动重试、不得发布**；若确认是断言方式过时（上游改了路径），走 `FIX_PR` 改 `apps/{app}.yaml`（属 AI 白名单外，需人工 review）。

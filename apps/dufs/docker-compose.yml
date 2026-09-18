@@ -1,0 +1,11 @@
+services:
+  dufs:
+    image: ${CORENOVA_APP_IMAGE}
+    restart: "no"
+    ports:
+      - "${CORENOVA_HOST_PORT}:${CORENOVA_CONTAINER_PORT}"
+    environment:
+      DUFS_SERVE_PATH: /data
+      DUFS_PORT: '5000'
+    volumes:
+      - ${CORENOVA_DATA_DIR}:/data

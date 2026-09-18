@@ -1,0 +1,62 @@
+app:
+  name: dufs
+  category: productivity
+  app_type: stateful_app
+  icon: /icons/dufs.svg
+  i18n:
+    en:
+      display_name: Dufs
+      description: A lightweight public read-only file browser and download server
+    zh:
+      display_name: Dufs 文件分发
+      description: 轻量公开只读文件浏览与下载服务
+source:
+  repo: sigoden/dufs
+  version_strategy: release_tag
+  release_filter:
+    prerelease: false
+    draft: false
+deploy:
+  docker_image: sigoden/dufs
+  image_tag_template: sigoden/dufs:{version}
+  container_port: 5000
+  compose_file: apps/dufs/docker-compose.yml
+  extra_environment:
+    - DUFS_SERVE_PATH=/data
+    - DUFS_PORT=5000
+health_check:
+  endpoint: /
+  expected_status: 200
+  timeout_seconds: 5
+  retries: 30
+  interval_seconds: 2
+  startup_timeout_seconds: 120
+  version_assertion:
+    kind: exec_command
+    command: [/bin/dufs, --version]
+    expected: 'dufs {version_no_v}'
+    match: exact
+tests:
+  predefined_dir: apps/dufs/tests
+  scenarios:
+  - slug: home
+    url: /
+    caption:
+      en: Public read-only file browser
+      zh: 公开只读文件浏览器
+deployment:
+  size: small
+  documentation_url: https://github.com/sigoden/dufs
+  regions: [us-east-1]
+  data_path: /data
+  post_deploy:
+    notes:
+    - en: This deployment serves public files read-only without sign-in. Place files in the mounted /data directory through the instance terminal. Do not store private files there. Browser uploads, deletion and WebDAV writes are disabled.
+      zh: 本部署无需登录，公开只读提供文件。通过实例终端将文件放入挂载的 /data 目录，请勿存放私密文件。浏览器上传、删除和 WebDAV 写入均关闭。
+website:
+  featured: false
+  screenshots_order: [home]
+  tags: [files, downloads, read-only]
+  features:
+  - en: Browse and download publicly shared files without permitting remote writes
+    zh: 浏览和下载公开分享的文件，禁止远程写入
