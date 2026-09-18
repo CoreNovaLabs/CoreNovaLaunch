@@ -41,6 +41,9 @@ jobs:
     timeout-minutes: 10
 
     env:
+      # 本工作流的全部职责就是写 R2：不回落 dir（否则去读 CI 里不存在的本地 fixtures，
+      # 静默全 absent）。application-verify 用 secret 默认 dir，这里相反，默认 r2。
+      VERIFIED_BACKEND: r2
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -81,6 +84,10 @@ jobs:
 
           cfg = Config.load()
           backend = make_backend(cfg)
+          if backend.name != "r2":
+              raise SystemExit(
+                  f"preflight 失败：backend={backend.name}，必须是 r2（VERIFIED_BACKEND 配置漂移）"
+              )
           raw, etag = backend.get_with_etag("verified/index.json")
           if not raw:
               # 深挖：桶可达性 + 凭据可见桶清单（桶名配置错误在此显形）
