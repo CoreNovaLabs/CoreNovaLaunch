@@ -1,0 +1,94 @@
+# sync-holds.yml - 运维性部署暂停的发布/解除（deployment-contract.md §2.5）
+#
+# hold 独立于验证结果：发布/解除不等下一次验证（否则"hold 拦住验证 → hold 字段
+# 永远进不了发布数据"死锁）。本工作流把 apps/*.yaml 的 deployment.hold 条件写
+# （If-Match）进已发布的 current.json，只动 deploy.hold 一个键，不碰 versions/、
+# index 与任何验证字段。
+#
+# 用法：
+#   - workflow_dispatch 手动触发（可传 apps 列表；解除暂停 = 先移除 yaml 里的 hold）
+#   - apps/** 或 holds 相关代码变化时自动触发（幂等，已一致则零写入）
+name: sync-holds
+
+on:
+  workflow_dispatch:
+    inputs:
+      apps:
+        description: "指定应用（逗号分隔，空=全部声明了 hold 的应用）"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - "apps/*.yaml"
+      - "corenova/holds.py"
+      - "scripts/verify/sync_holds.py"
+      - ".github/workflows/sync-holds.yml"
+
+# 与 application-verify 的 verify-<app> 可能并发触碰同一对象：条件写失败只跳过
+# 不重试（重跑本工作流即可），不做全局互斥以免长时间占组。
+concurrency:
+  group: sync-holds
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: write deploy.hold -> published current.json
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+
+    steps:
+      # 与 publish-template 同一精神：本工作流的全部职责就是写 R2，凭据缺失必须红
+      - name: Guard - R2 凭据必填
+        env:
+          HAS_R2: ${{ secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_NAME != '' && '1' || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HAS_R2}" ]; then
+            echo "::error::sync-holds 需要 R2_BUCKET_NAME / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY。"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Sync holds -> current.json
+        env:
+          APPS: ${{ github.event.inputs.apps }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APPS//[[:space:]]/}" ]; then
+            ARGS=""
+            IFS=',' read -ra NAMES <<< "${APPS}"
+            for name in "${NAMES[@]}"; do
+              ARGS="${ARGS} --app $(echo "${name}" | xargs)"
+            done
+            # shellcheck disable=SC2086
+            python scripts/verify/sync_holds.py ${ARGS}
+          else
+            python scripts/verify/sync_holds.py
+          fi
+
+      - name: Job summary
+        if: always()
+        run: |
+          echo "### Deployment holds 同步完成" >> "$GITHUB_STEP_SUMMARY"
+          echo "只改动 \`deploy.hold\` 一个键；versions/、index.json 与验证字段未触碰。" >> "$GITHUB_STEP_SUMMARY"
