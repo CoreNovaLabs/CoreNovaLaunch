@@ -1,7 +1,7 @@
 # Contract · App Profiles（应用推荐配置档）
 
 > 优先级：**最高**（contracts/ 高于普通设计文档；本契约与 app-schema.md 冲突时，本契约的尺寸阶梯作为**缺省基准**，app-schema 显式选择优先——且**向上自由、低于 `min_size` 地板才需声明 reason**）。
-> 术语：本文沿用 Repo A / Repo B / Repo C 代号，分别指 `CoreNovaLaunchWebsite`（官网，本地目录 `website/`）、`CoreNovaLaunchAmi`（AMI 构建，引导期未落地）、`CoreNovaLaunchVerify`（验证枢纽）。
+> 术语：本文沿用 Repo A / Repo B / Repo C 代号，分别指 `CoreNovaLaunchWebsite`（官网，本地目录 `website/`）、`CoreNovaLaunchAmi`（AMI 构建，引导期未落地）、`CoreNovaLaunch`（验证枢纽）。
 > 适用：Repo C `apps/{app}.yaml` 中 `deploy.instance_type` / `deploy.disk_gb` / `deployment` 端口档 / `resources` 的推荐基准。
 > 本文回答一个问题："不同应用该用什么配置？"——按 `app_type`（部署类型）给**尺寸阶梯**，既避免每个应用从零拍脑袋，也允许应用**自由上选更大配置**（而非被钉死最低档），仅对跌破安全/资源地板的情况要求说明理由。
 

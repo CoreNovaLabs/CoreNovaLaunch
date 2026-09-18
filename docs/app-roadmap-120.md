@@ -34,10 +34,10 @@
 
 2026-09-16：Homer `v26.08.3`、IT-Tools `v2024.10.22-7ca5933`、CyberChef `v11.4.0`
 和 draw.io `v31.4.5` 已通过本地与 CI 完整验证并发布至公开数据源（4/10）。
-验证任务：[Homer](https://github.com/CoreNovaLabs/CoreNovaLaunchVerify/actions/runs/35062601771)、
-[IT-Tools](https://github.com/CoreNovaLabs/CoreNovaLaunchVerify/actions/runs/35062605378)、
-[CyberChef](https://github.com/CoreNovaLabs/CoreNovaLaunchVerify/actions/runs/35062608111)、
-[draw.io](https://github.com/CoreNovaLabs/CoreNovaLaunchVerify/actions/runs/35062611179)。
+验证任务：[Homer](https://github.com/CoreNovaLabs/CoreNovaLaunch/actions/runs/35062601771)、
+[IT-Tools](https://github.com/CoreNovaLabs/CoreNovaLaunch/actions/runs/35062605378)、
+[CyberChef](https://github.com/CoreNovaLabs/CoreNovaLaunch/actions/runs/35062608111)、
+[draw.io](https://github.com/CoreNovaLabs/CoreNovaLaunch/actions/runs/35062611179)。
 四项 `verify` job 均成功；中间两项官网通知被并发队列替换，末次通知和官网构建已成功。
 本批按实际部署条件拆分，剩余 6 项保留候选资格：
 
@@ -71,7 +71,7 @@
 2026-09-18：Dufs `v0.46.0` 已接入公开只读形态，禁止匿名上传、删除及 WebDAV 写入。
 已补充无 shell 镜像的 argv 版本断言，保留原字符串命令兼容性，238 项回归测试通过。
 本机 Docker API 无响应，未重启或影响其他容器；完整验证交由
-[CI 验证任务](https://github.com/CoreNovaLabs/CoreNovaLaunchVerify/actions/runs/35349743323)，
+[CI 验证任务](https://github.com/CoreNovaLabs/CoreNovaLaunch/actions/runs/35349743323)，
 CI 的 `verify dufs` 已成功，公开 `current.json` 已确认发布版本 `v0.46.0`，
 验证编号 `dufs-v0.46.0-20260918-001`（本批已发布 1/10）。
 

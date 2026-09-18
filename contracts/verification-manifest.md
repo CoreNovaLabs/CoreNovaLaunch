@@ -1,8 +1,8 @@
 # Contract · Verification Manifest（验证清单）
 
 > 优先级：**最高**。
-> 术语：本文沿用 Repo A / Repo B / Repo C 代号，分别指 `CoreNovaLaunchWebsite`（官网，本地目录 `website/`）、`CoreNovaLaunchAmi`（AMI 构建，引导期未落地）、`CoreNovaLaunchVerify`（验证枢纽）。
-> 适用：Repo C `CoreNovaLaunchVerify` 产出的验证记录，上传至 R2 `verified/{app}/current.json` 与 `verified/{app}/versions/{app_version}.json`。
+> 术语：本文沿用 Repo A / Repo B / Repo C 代号，分别指 `CoreNovaLaunchWebsite`（官网，本地目录 `website/`）、`CoreNovaLaunchAmi`（AMI 构建，引导期未落地）、`CoreNovaLaunch`（验证枢纽）。
+> 适用：Repo C `CoreNovaLaunch` 产出的验证记录，上传至 R2 `verified/{app}/current.json` 与 `verified/{app}/versions/{app_version}.json`。
 > 本文定义"验证了什么"的不可变记录格式。任何设计文档与之冲突，以本文为准。
 
 ## 1. 为什么需要 Verification Identity
@@ -127,7 +127,7 @@
         "caption": { "en": "Admin", "zh": "管理后台" } }
     ],
     "report_url": "https://<r2-public>/reports/ghost-v5.75.0-20260827-001.html",
-    "workflow_run_url": "https://github.com/<org>/CoreNovaLaunchVerify/actions/runs/123456"
+    "workflow_run_url": "https://github.com/<org>/CoreNovaLaunch/actions/runs/123456"
   },
 
   "website": {
@@ -147,7 +147,7 @@
     "architecture": "x86_64",
     "region": "us-east-1",
     "report_url": "https://<r2-public>/reports/ghost-v5.75.0-20260827-001.html",
-    "workflow_run_url": "https://github.com/<org>/CoreNovaLaunchVerify/actions/runs/123456",
+    "workflow_run_url": "https://github.com/<org>/CoreNovaLaunch/actions/runs/123456",
     "features": [
       { "en": "Automated testing before each release", "zh": "每次发布前自动化测试" },
       { "en": "One-click CloudFormation deploy", "zh": "CloudFormation 一键部署" }

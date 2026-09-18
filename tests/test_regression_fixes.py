@@ -327,7 +327,7 @@ class TestResolveFailures:
             calls.append((method, url, data or {}))
 
         monkeypatch.setattr(failure, "http_request", fake_request)
-        monkeypatch.setenv("GITHUB_REPOSITORY", "CoreNovaLabs/CoreNovaLaunchVerify")
+        monkeypatch.setenv("GITHUB_REPOSITORY", "CoreNovaLabs/CoreNovaLaunch")
         return failure, calls
 
     def _items(self, failure, monkeypatch, bodies):
@@ -342,9 +342,9 @@ class TestResolveFailures:
         failure, calls = ledger
         self._items(failure, monkeypatch, [_ledger_body("v6.61.0", "ghost-v6.61.0-20260831-001")])
         failure.resolve_failures("ghost", "v6.61.0", "ghost-v6.61.0-20260901-003")
-        assert ("POST", "https://api.github.com/repos/CoreNovaLabs/CoreNovaLaunchVerify/issues/1/comments") in [
+        assert ("POST", "https://api.github.com/repos/CoreNovaLabs/CoreNovaLaunch/issues/1/comments") in [
             (m, u) for m, u, _ in calls]
-        assert ("PATCH", "https://api.github.com/repos/CoreNovaLabs/CoreNovaLaunchVerify/issues/1") in [
+        assert ("PATCH", "https://api.github.com/repos/CoreNovaLabs/CoreNovaLaunch/issues/1") in [
             (m, u) for m, u, _ in calls]
 
     def test_verification_id_match_closes(self, ledger, monkeypatch):

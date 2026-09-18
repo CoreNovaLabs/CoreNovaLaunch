@@ -1,8 +1,8 @@
 # Contract · Platform Contract（平台黄金契约）
 
 > 优先级：**最高**。
-> 术语：本文沿用 Repo A / Repo B / Repo C 代号，分别指 `CoreNovaLaunchWebsite`（官网，本地目录 `website/`）、`CoreNovaLaunchAmi`（AMI 构建，引导期未落地）、`CoreNovaLaunchVerify`（验证枢纽）。
-> 适用：Repo B `CoreNovaLaunchAmi` + Repo C `CoreNovaLaunchVerify` 的 AWS Golden Verification 产物。
+> 术语：本文沿用 Repo A / Repo B / Repo C 代号，分别指 `CoreNovaLaunchWebsite`（官网，本地目录 `website/`）、`CoreNovaLaunchAmi`（AMI 构建，引导期未落地）、`CoreNovaLaunch`（验证枢纽）。
+> 适用：Repo B `CoreNovaLaunchAmi` + Repo C `CoreNovaLaunch` 的 AWS Golden Verification 产物。
 > 本文规定"平台（AMI/CFN/运行时）何时算验证过、何时失效"。任何设计文档与之冲突，以本文为准。
 
 ## 1. 目的

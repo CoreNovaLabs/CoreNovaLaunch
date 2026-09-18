@@ -1,7 +1,7 @@
 # Contract · Workflow State Machine（工作流状态机）
 
 > 优先级：**最高**。
-> 术语：本文沿用 Repo A / Repo B / Repo C 代号，分别指 `CoreNovaLaunchWebsite`（官网，本地目录 `website/`）、`CoreNovaLaunchAmi`（AMI 构建，引导期未落地）、`CoreNovaLaunchVerify`（验证枢纽）。
+> 术语：本文沿用 Repo A / Repo B / Repo C 代号，分别指 `CoreNovaLaunchWebsite`（官网，本地目录 `website/`）、`CoreNovaLaunchAmi`（AMI 构建，引导期未落地）、`CoreNovaLaunch`（验证枢纽）。
 > 适用：Repo C 的所有验证/部署工作流（Application Verification 与 Platform Verification）。
 > 本文保证流程确定性：同一时刻每个 app 的状态唯一、可追溯。任何设计文档与之冲突，以本文为准。
 
@@ -146,7 +146,7 @@ classification: TRANSIENT
 failed_stage: VERIFYING            # RESOLVED | VERIFYING | PUBLISHING
 failed_check: health_check_passed  # 九项 checks 之一，或 resolve_digest / compose_up
 attempts: 2
-run_url: https://github.com/<org>/CoreNovaLaunchVerify/actions/runs/123456
+run_url: https://github.com/<org>/CoreNovaLaunch/actions/runs/123456
 platform_verification_id: plat-us-east-1-x86_64-20260827-001
 ```
 ````

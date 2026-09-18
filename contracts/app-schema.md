@@ -1,8 +1,8 @@
 # Contract · App Schema（应用注册 Schema）
 
 > 优先级：**最高**（contracts/ 高于普通设计文档）。
-> 术语：本文沿用 Repo A / Repo B / Repo C 代号，分别指 `CoreNovaLaunchWebsite`（官网，本地目录 `website/`）、`CoreNovaLaunchAmi`（AMI 构建，引导期未落地）、`CoreNovaLaunchVerify`（验证枢纽）。
-> 适用：Repo C `CoreNovaLaunchVerify` 中的应用注册文件 `apps/{app}.yaml`。
+> 术语：本文沿用 Repo A / Repo B / Repo C 代号，分别指 `CoreNovaLaunchWebsite`（官网，本地目录 `website/`）、`CoreNovaLaunchAmi`（AMI 构建，引导期未落地）、`CoreNovaLaunch`（验证枢纽）。
+> 适用：Repo C `CoreNovaLaunch` 中的应用注册文件 `apps/{app}.yaml`。
 > 本契约定义应用元数据的**唯一事实源**。任何设计文档、脚本、工作流与本文冲突时，以本文为准。
 
 ## 0. 核心原则：单一事实源
