@@ -1,82 +1,223 @@
-# CoreNovaLaunchVerify（Repo C）
+# CoreNovaLaunch
 
-应用注册 + Application Verification + Publish Gate + 网站事实源产出。
-架构与契约见 umbrella 仓库 `../docs/`（`docs/contracts/` 优先级最高，本仓 `contracts/` 是它的镜像副本）。
+English | [简体中文](README.zh-CN.md)
 
-## 这个仓库负责什么
+The application verification and publishing component of **CoreNova Launch**. It registers self-hosted applications, tests digest-pinned container images, and publishes the verified data consumed by the website.
 
-| 做 | 不做 |
-|----|------|
-| `apps/*.yaml` 应用注册（App Schema 唯一事实源） | 构建 AMI（归 Repo B；引导期直接引用公开 AMI） |
-| Application Verification：compose → 就绪 → 版本断言 → 预写测试 → Playwright 截图 | 部署到 EC2 验证应用（应用验证零 AWS 资源、零 AWS 费用） |
-| Publish Gate 两阶段提交，写 `verified/{index,current,versions/*}.json` + 截图 + 报告 | 让未通过门禁的数据进网站事实源 |
-| 按需跑 AWS Golden Verification 产出 Platform Contract | 把 `ami_id`/`region` 写进 app schema |
-| `repository_dispatch(verified-update)` 触发 Repo A 重建 | 直接改 Repo A 的代码或数据 |
+```text
+App registration → Version & image resolution → Container verification → Publish Gate → Website data
+                                                     ↑
+                                              Platform Contract
+```
 
-## 本地跑一次真实验证
+- **Application Verification** runs Docker Compose, readiness checks, version assertions, predefined tests, and Playwright screenshots. It does not create AWS resources.
+- **Publish Gate** commits manifests, reports, screenshots, and indexes through a two-phase process; the website consumes published data instead of inferring verification results.
+- **Golden Verification** separately tests the AWS platform and produces a Platform Contract. It creates billable resources.
+
+This repository does not build AMIs or implement the website. The production publishing path remains single-container v1; experimental stack v2 does not replace existing deployments.
+
+[Quick start](#quick-start) · [Configuration](#configuration-and-artifacts) · [Add an app](#add-an-application) · [Deployment safety](#deployment-safety) · [Maintenance](#maintenance) · [Reference](#reference)
+
+## Quick start
+
+Run all commands from the `CoreNovaLaunch` directory.
+
+### 1. Install dependencies
+
+Use Python **3.10+** (3.12 recommended). Application verification also requires a running Docker daemon with Compose v2, network access to GitHub and the image registry, and Playwright Chromium. The examples use an authenticated GitHub CLI (`gh auth login`) to supply `GITHUB_TOKEN`.
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 .venv/bin/python -m playwright install chromium
+```
 
-# 1) 契约校验（不碰 Docker/AWS/网络）
+### 2. Run offline checks
+
+After dependency installation, these checks require no Docker, AWS credentials, or network access:
+
+```bash
 .venv/bin/python scripts/verify/validate_app_schema.py --all
+.venv/bin/python scripts/verify/golden_verify.py --check
+.venv/bin/python -m pytest tests -q
+```
 
-# 2) 只解析不验证：看 app_version 与不可变 digest
-GITHUB_TOKEN=$(gh auth token) .venv/bin/python scripts/verify/resolve_version.py --app ghost
-GITHUB_TOKEN=$(gh auth token) .venv/bin/python scripts/verify/resolve_image.py --app ghost
+### 3. Verify an application without publishing
 
-# 3) 完整验证（需要本机 Docker 可用）。--no-publish 表示只到 VERIFIED，不动网站事实源
+Replace `ghost` with a name from [apps/](apps/).
+
+```bash
 GITHUB_TOKEN=$(gh auth token) .venv/bin/python \
   scripts/verify/run_application_verify.py --app ghost --no-publish --skip-ami-drift
+```
 
-# 4) 九项 checks 全过才写 current.json（引导期后端 = 本地 data/）
+- `--no-publish` stops before publication: it does not update `current.json` or the published indexes.
+- `--skip-ami-drift` skips the AWS public-AMI drift lookup for local testing without AWS credentials. It does **not** bypass the other Platform Contract checks or establish new platform verification evidence.
+- A valid, matching Platform Contract must already exist in the selected backend. A fresh checkout or changed platform assets may require a maintainer to provide or regenerate it; offline checks alone do not create one.
+
+For normal verification with drift checking, omit `--skip-ami-drift` and provide the required AWS read credentials. Publishing is a separate, deliberate step under [Maintenance](#maintenance).
+
+## Configuration and artifacts
+
+[config/verify.yaml](config/verify.yaml) controls verification and publishing; [config/platform.yaml](config/platform.yaml) defines platform identity. Environment variables override configuration values.
+
+| Setting | Purpose |
+| --- | --- |
+| `GITHUB_TOKEN` | Authenticate upstream release and repository queries. |
+| `VERIFIED_BACKEND` | Select `dir` or `r2`; the checked-in default is `dir`. There is no automatic fallback between backends. |
+| `VERIFIED_OUTPUT_DIR` | Local output directory; defaults to `data/`. |
+| `CORENOVA_REGISTRY_MIRROR` | Optional registry prefix. Changes the pull path, not the image identity recorded in the Manifest. |
+| `CORENOVA_PROBE_HOST` | Host reachable by the verifier when Docker runs elsewhere; for example, `host.docker.internal` where supported. |
+| `R2_*` | R2 endpoint, bucket, public URL, and credentials when using the R2 backend. |
+| `SITE_REPO` / `REPO_A_PAT` | Target repository and credential for the website rebuild notification. |
+
+Do not put credentials in app registrations or commit them to Git. See [corenova/config.py](corenova/config.py) for configuration overrides and [the workflows](.github/workflows/) for CI environment wiring.
+
+Local artifacts are kept under `data/`: `runs/{verification_id}/state.json`, reports, screenshots, and—when publishing to the `dir` backend—`verified/` records. With R2 selected, local artifacts are not an alternative website data source. `data/` is not tracked by Git.
+
+## Add an application
+
+Start with the [App Schema](contracts/app-schema.md) and [application profiles](contracts/app-profiles.md).
+
+1. Generate a scaffold with `scripts/dev/new_app.py` (`--help` lists the required arguments). The generator leaves TODOs for facts that must be checked manually.
+2. Complete `apps/{name}.yaml`: health endpoint, version assertion, persistent data path, and English/Chinese copy. Image templates must resolve to exact version tags, never moving tags such as `latest`.
+3. Complete `apps/{name}/docker-compose.yml`. Inject the image, ports, public URL, and data directory through `CORENOVA_APP_IMAGE`, `CORENOVA_HOST_PORT`, `CORENOVA_CONTAINER_PORT`, `CORENOVA_APP_URL`, and `CORENOVA_DATA_DIR`.
+4. Add pytest and Playwright coverage under `apps/{name}/tests/`. Assert observed behavior only; document unverified capabilities. Scenario slugs must be ASCII and match `website.screenshots_order`.
+5. Validate the schema and run application verification with `--no-publish` first. Publish only after the gates pass. Add `{name}.svg` to the website repository's `public/icons/` separately.
+
+Keep Compose behavior, deployment parameters, and capability descriptions consistent. Do not describe a host mount, exposed port, or authentication mechanism as available unless the deployment actually provides it.
+
+## Deployment safety
+
+These settings apply to the current [single-container CloudFormation template](templates/cloudformation/fixed/app.yaml), not automatically to existing instances.
+
+| Capability | Default and opt-in behavior |
+| --- | --- |
+| Web access | `AllowedWebCidr=127.0.0.1/32`: HTTP, HTTPS, and health paths allow local access only. Use SSM forwarding for initial setup. |
+| Host Docker control | `DockerSocketAccess=false`. Enabling it grants host-root-equivalent control; restrict access and configure authentication first. |
+| Extra business ports | `ExtraTcpPort=0` and `ExtraUdpPort=0` disable publication. When enabled, Docker mappings and security-group rules use the selected ports and `ExtraPortIngressCidr`. |
+| Uploads and WebSocket | Shared HTTP/HTTPS configuration; `MaxUploadSizeMb=100` MiB, adjustable up to 10240 MiB. Application limits still apply. Streaming and WebSocket upgrades are enabled; proxy read/write timeouts are 3600 seconds. |
+| Persistent data | For non-root image users, empty directories receive image-user ownership; existing nonempty directories with mismatched ownership cause startup to fail. No recursive ownership or permission changes are made. |
+
+For direct Web access, allow only an administrator/VPN CIDR and narrow `HttpIngressCidr` accordingly. A CIDR allowlist is not application authentication. Configure authentication and HTTPS before intentionally exposing a public service.
+
+<details>
+<summary>SSM access and application-specific notes</summary>
+
+With AWS CLI, the Session Manager plugin, and appropriate IAM permissions, replace the instance ID and start a tunnel:
+
+```bash
+aws ssm start-session --target i-xxxxxxxxxxxxxxxxx \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["80"],"localPortNumber":["8080"]}'
+```
+
+Open `http://localhost:8080`. For an app used exclusively through this tunnel, set `LaunchUrl` to the same address.
+
+- **code-server / data ownership:** numeric image UIDs do not require an in-image shell or `id`; a fresh ext4 volume's `lost+found` is allowed. Environment files use the `corenova-app` group.
+- **URL injection:** `AppUrlEnvironmentName` takes precedence. `ExtraEnvironment` expands only `${CORENOVA_APP_URL}`; a required URL that cannot be resolved or an unknown placeholder causes failure. Configuration is not evaluated as shell code.
+- **Portainer:** the default verifies service startup, not management of the host Docker engine. Local management requires explicit socket access; remote environments require separate setup.
+- **Netdata:** container-agent scope only; no host `/proc`, `/sys`, cgroup, Docker socket, or extra capabilities. Full host monitoring needs separate assessment. Netdata Cloud claiming does not protect the local Agent endpoint.
+- **Syncthing:** direct sync requires `ExtraTcpPort=22000`, `ExtraUdpPort=22000`, and a peer CIDR in `ExtraPortIngressCidr`. The GUI remains loopback-bound; UDP 21027 LAN discovery is not exposed. Rules target the supplied `SecurityGroupId`, which should be instance-specific when using an existing network.
+- **Vikunja:** new deployments keep SQLite and attachments in `/db` via `VIKUNJA_FILES_BASEPATH=/db`. Old containers may still hold attachments in `/app/vikunja/files`; export and restore-test them before replacing the container.
+
+</details>
+
+**Existing deployments require a maintenance plan.** Updating a template or CloudFormation parameters does not automatically replay cfn-init. Back up data, verify recovery, then explicitly apply the configuration. A database-engine change needs a separate backup, migration, restore, cutover, and rollback design—not just a new template and a restart. Experimental v2 does not pass through the v1 publishing gate.
+
+## Maintenance
+
+<details>
+<summary>Resolve versions and images without running verification</summary>
+
+These commands query GitHub and the image registry; they do not verify or publish an application.
+
+```bash
+GITHUB_TOKEN=$(gh auth token) .venv/bin/python scripts/verify/resolve_version.py --app ghost
+GITHUB_TOKEN=$(gh auth token) .venv/bin/python scripts/verify/resolve_image.py --app ghost
+```
+
+</details>
+
+<details>
+<summary>Change templates and run local regression tests</summary>
+
+Edit `templates/cloudformation/fixed/init/*.sh`, then synchronize the embedded scripts in `app.yaml` and regenerate `canary.yaml`:
+
+```bash
+.venv/bin/python scripts/verify/golden_verify.py --sync-init
+.venv/bin/python scripts/verify/golden_verify.py --check
+.venv/bin/python -m ruff check corenova scripts tests apps
+.venv/bin/python -m pytest tests -q
+```
+
+Optional Docker integration tests use preloaded local images and clean up their temporary containers and volumes. Missing images fail the tests; they are not pulled automatically.
+
+```bash
+CORENOVA_TEST_DOCKER=1 .venv/bin/python -m pytest tests/test_user_template.py -q
+```
+
+Local tests are not a substitute for AWS Golden Verification.
+
+</details>
+
+<details>
+<summary>Run AWS Golden Verification — creates billable resources</summary>
+
+Preview the plan without AWS calls:
+
+```bash
+.venv/bin/python scripts/verify/golden_verify.py --dry-run
+```
+
+Only with AWS credentials and authorization to create resources, run the actual verification:
+
+```bash
+.venv/bin/python scripts/verify/golden_verify.py
+```
+
+This creates a canary, runs platform probes, writes the Platform Contract, and attempts cleanup. Confirm cleanup has completed. Public-AMI mode installs Docker/Nginx with cfn-init and requires platform re-verification within 30 days.
+
+</details>
+
+<details>
+<summary>Publish verified data — writes to the selected backend</summary>
+
+Check the backend and credentials before running. Without `--no-publish`, a successful verification proceeds to publication and may notify the website repository when configured:
+
+```bash
 GITHUB_TOKEN=$(gh auth token) .venv/bin/python \
   scripts/verify/run_application_verify.py --app ghost
 ```
 
-产物落在 `data/`：`verified/`、`screenshots/`、`reports/`、`runs/{verification_id}/`（含 `state.json` 与
-HTML 报告）。`data/` 不进 Git——它是引导期与 R2 互斥的临时后端（`docs/repo-structure.md` §4.2.1）。
+The Publish Gate requires all nine checks before committing `current.json`. R2 website data and the public S3 one-click template are separate publishing channels; template distribution uses `scripts/verify/build_user_template.py` and the `publish-template` workflow.
 
-无法直连 Docker Hub 的网络（如本机）用镜像站前缀，只影响拉取路径、不改 Manifest 里的镜像身份：
+</details>
 
-```bash
-CORENOVA_REGISTRY_MIRROR=docker.m.daocloud.io .venv/bin/python scripts/verify/run_application_verify.py --app ghost
-```
+### CI workflows
 
-验证器与 Docker daemon 不同机时（自托管 runner、容器内跑验证）用 `CORENOVA_PROBE_HOST=host.docker.internal`。
+| Workflow | Responsibility |
+| --- | --- |
+| `pr-checks` | Lint, app-schema validation, and repository tests. |
+| `monitor-versions` | Discover upstream versions every six hours. |
+| `application-verify` | Verify and publish an application with app-level concurrency control. |
+| `golden-verify` | Verify the AWS platform on dispatch or on the 1st and 16th of each month. |
+| `publish-template` | Publish the one-click template and check anonymous readability. |
+| `publish-site` | Notify the website repository to rebuild. |
+| `reverify-failed` | Retry failures classified as `TRANSIENT`. |
 
-## 平台契约（`required_platform_contract_valid` 的依据）
+## Reference
 
-```bash
-.venv/bin/python scripts/verify/golden_verify.py --check      # 离线静态检查（CFN 函数白名单/SG/端口/硬编码）
-.venv/bin/python scripts/verify/golden_verify.py --dry-run    # 打印 16 步计划 + 契约预览，零 AWS 调用
-.venv/bin/python scripts/verify/golden_verify.py              # 真跑：创建 canary → 11 项探针 → 写契约 → 清理
-```
+| Path | Contents |
+| --- | --- |
+| [apps/](apps/) | App registrations, Compose definitions, and application tests. |
+| [corenova/](corenova/) | Verification, manifest generation, and publishing logic. |
+| [scripts/](scripts/) | Verification, monitoring, and development entry points. |
+| [templates/](templates/) | CloudFormation templates and initialization assets. |
+| [tests/](tests/) | Repository regression tests. |
 
-引导期 `config/platform.yaml` 的 `base_ami_source: public` 表示用厂商公开 AMI（无镜像软件费），
-Docker/Nginx 由 cfn-init 现装；切自建/收费 AMI 只改这一个字段与 SSM 参数名，契约其余不变
-（`docs/contracts/platform-contract.md` §2.1）。公开 AMI 会被滚动替换，因此复验周期硬性 ≤30 天。
+Contracts: [App Schema](contracts/app-schema.md) · [Platform Contract](contracts/platform-contract.md) · [Verification Manifest](contracts/verification-manifest.md) · [Deployment Contract](contracts/deployment-contract.md) · [Workflow State Machine](contracts/workflow-state-machine.md).
 
-## 接入新应用
+Application planning: [App roadmap](docs/app-roadmap-120.md).
 
-1. 生成三件套骨架（字段与默认值见 `contracts/app-schema.md` §1/§2）：
-   `.venv/bin/python scripts/dev/new_app.py --name {name} --repo owner/repo --image owner/img --port {port} --category {cat}`
-   生成器只填机器可推导字段，其余留 TODO 并打印「事实核对单」；内容型字段由校验器强制补齐。
-2. 按核对单在真容器内实测，再填 `apps/{name}.yaml` 的 TODO：健康端点、`version_assertion`、
-   数据卷、双语文案。`image_tag_template` 必须渲染出**精确 tag**（禁止 `:latest` 等移动 tag）。
-3. 填 `apps/{name}/docker-compose.yml`：image/端口/URL/数据目录一律用注入变量
-   （`CORENOVA_APP_IMAGE` / `CORENOVA_HOST_PORT` / `CORENOVA_CONTAINER_PORT` / `CORENOVA_APP_URL` /
-   `CORENOVA_DATA_DIR`），不得出现字面量。
-4. 填 `apps/{name}/tests/`（pytest + Playwright）。断言只写**实测成立的事实**；不确定的行为宁可不测并写明原因。
-   `tests.scenarios[].slug` 必须是 ASCII（截图文件名），并与 `website.screenshots_order` 一致。
-5. 跑 `validate_app_schema.py --app {name}` 到零违规，再跑 `run_application_verify.py --app {name}` 全链路。
-6. 官网图标（唯一人工静态资产）：把 `{name}.svg` 放进 Website 仓 `public/icons/`。
-
-## CI
-
-`.github/workflows/`：`monitor-versions`（每 6h 发现新版本并按 app 扇出）、`application-verify`
-（app 级并发、`app_name` 空值即失败）、`golden-verify`（平台变更/手动/每月复验）、`publish-site`
-（→ Repo A dispatch）、`reverify-failed`（只重试 TRANSIENT，台账见 `contracts/workflow-state-machine.md` §7）。
-
-Secrets 见 `docs/repo-structure.md` §6。本地自测：`.venv/bin/python -m pytest tests -q`。
+In the umbrella workspace, architecture and cross-repository setup are documented under `../docs/`, with CI secret requirements in `../docs/repo-structure.md` §6. Its `docs/contracts/` directory is authoritative; this repository's `contracts/` contains mirrored copies. Keep the English and Chinese READMEs aligned when changing commands or operational boundaries.
