@@ -160,6 +160,12 @@ def build(
     if isinstance(app_url_env_name, str) and app_url_env_name:
         website["deploy"]["app_url_env_name"] = app_url_env_name
 
+    # 运维性部署暂停（app-schema.md 规则21）：注册了才投影。hold 独立于验证结果，
+    # 官网以 deploy.hold 渲染暂停原因并拦截部署入口（“已验证”≠“当前可部署”）。
+    hold = spec.g("deployment.hold")
+    if isinstance(hold, dict) and isinstance(hold.get("reason"), dict) and hold["reason"].get("en"):
+        website["deploy"]["hold"] = {"reason": hold["reason"]}
+
     manifest: dict[str, Any] = {
         "schema_version": "1.0",
         "verification_id": vid,

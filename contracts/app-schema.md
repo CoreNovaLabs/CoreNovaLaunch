@@ -121,6 +121,12 @@ deployment:                           # required, 网站展示用的静态部署
                                       # 是 CFN DataContainerPath 参数的真相源；必须以 / 开头（§5 规则19）
   app_url_env_name: "url"             # optional, string；接收公开访问 URL 的应用原生环境变量名
                                       # （Ghost 为 url）；值由 CFN 按 LaunchUrl/PublicDnsName 注入（规则20）
+  hold:                               # optional, 运维性部署暂停（规则21）：独立于历史验证结果，
+                                      # “已验证”≠“当前可部署”；官网拦截所有部署入口并展示原因。
+                                      # 解除条件是生产契约重新验证通过（不是版本更新），移除后重跑 sync_holds
+    reason:                           # required, Localized；暂停原因（双语），官网原样渲染
+      en: "Deployment paused pending production-contract re-verification."
+      zh: "暂停部署：待完成生产契约重新验证。"
 
 release_type_override: null           # optional, enum(initial|new_version|security_update|bug_fix)
                                       # 仅在上游 release notes 无法被 deployment-contract.md §4.1 规则可靠判定时人工覆盖；非空必须带 `# reason:` 注释
@@ -282,6 +288,7 @@ health_check:
 18. `deployment.cost_estimate` 若存在：必须是映射；`monthly_usd` 必须为正数（写了 `cost_estimate` 就必须给出可信数字）；`note` 若存在 `en`/`zh` 均非空，且含 `secret`/`password`/`token`/`private_key`（不区分大小写）即校验失败——价格与口径是注册时人工核对的事实，前端只展示、绝不按实例规格自行计算。
 19. `stateful_app` 必须声明 `deployment.data_path`；其他类型若声明也必须为以 `/` 开头的字符串；含空格或 shell 元字符（`;&|`$`）则校验失败。该值必须与应用 compose 文件的容器挂载目标一致——它是 CFN `DataContainerPath` 参数的唯一真相源，compose / CFN / extra_environment 三处不得各自硬编码导致漂移。
 20. `deployment.app_url_env_name` 若存在，必须匹配 `^[A-Za-z_][A-Za-z0-9_]*$`。它只声明应用原生变量名；变量值由 CloudFormation 在启动时根据显式 `LaunchUrl` 或实例 `PublicDnsName` 生成，禁止 app schema、前端或模板写死部署地址。
+21. `deployment.hold` 若存在：必须是映射且仅含 `reason` 键；`reason` 的 `en`/`zh` 均非空，且含 `secret`/`password`/`token`/`private_key`（不区分大小写）即校验失败。hold 是**运维性部署暂停**，独立于验证结果（`status: verified` 的应用也可能被 hold）；声明后投影进 `current.json` 的 `deploy.hold`，官网以此拦截全部部署入口。发布与解除走 `scripts/verify/sync_holds.py`（条件写，不动 versions/、index 与任何验证字段），不等下一次验证——否则“hold 拦住验证 → hold 字段永远进不了发布数据”死锁。
 
 ## 6. 反模式
 
@@ -298,6 +305,7 @@ health_check:
 - ❌ compose 文件的容器挂载目标、`extra_environment` 中的路径引用、CFN `DataContainerPath` 三处各自硬编码不同路径（必须以 `deployment.data_path` 为唯一真相源，规则 19）。
 - ❌ 前端猜测应用接收公开 URL 的变量名，或在 `extra_environment` 写死主机名（必须来自 `deployment.app_url_env_name`，规则 20）。
 - ❌ 把 `ami_id` / `region` 写进 app schema（那是平台层契约，归 Platform Contract）。
+- ❌ 用版本重新验证代替暂停解除：`deployment.hold` 的解除条件是生产契约重新验证通过，验证流水线也不负责写入 hold（那是 sync_holds 的运维路径，规则 21）。
 
 ## 7. 部署模型边界：当前为单容器（2026-08-30 明确）
 

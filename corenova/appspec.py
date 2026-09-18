@@ -1,4 +1,4 @@
-"""Load `apps/{app}.yaml` and enforce app-schema.md §5 (20 rules) + app-profiles.md.
+"""Load `apps/{app}.yaml` and enforce app-schema.md §5 (21 rules) + app-profiles.md.
 
 The validator is deliberately self-contained: Repo C's CI must be able to reject a bad
 registration before any Docker / AWS / network work happens.
@@ -371,6 +371,23 @@ def validate(spec: AppSpec, root: Path, platform_region: str) -> list[str]:
             "规则20: deployment.app_url_env_name 必须匹配 "
             f"^[A-Za-z_][A-Za-z0-9_]*$，实为 {app_url_env_name!r}"
         )
+
+    # 21 deployment.hold：运维性部署暂停，独立于历史验证结果（“已验证”≠“当前可部署”）。
+    # 解除条件是生产契约重新验证通过，不是版本更新；reason 必须双语，官网原样渲染。
+    hold = g("deployment.hold")
+    if hold is not None:
+        if not isinstance(hold, dict):
+            e.append(f"规则21: deployment.hold 必须是映射，实为 {type(hold).__name__}")
+        else:
+            reason = hold.get("reason")
+            if not isinstance(reason, dict) or not reason.get("en") or not reason.get("zh"):
+                e.append("规则21: hold.reason.{en,zh} 必须均非空（暂停原因必须双语说明）")
+            elif re.search(r"secret|password|token|private_key",
+                           str(reason.get("en")) + str(reason.get("zh")), re.I):
+                e.append("规则21: hold.reason 含敏感词——暂停说明不涉及凭据类内容")
+            unexpected = sorted(set(hold) - {"reason"})
+            if unexpected:
+                e.append(f"规则21: deployment.hold 不允许额外键 {unexpected}")
 
     # tests 目录
     tdir = g("tests.predefined_dir")

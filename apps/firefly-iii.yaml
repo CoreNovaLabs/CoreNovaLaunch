@@ -62,6 +62,12 @@ deployment:
   size: "small"
   documentation_url: "https://docs.firefly-iii.org"
   regions: ["us-east-1"]
+  # 运维性部署暂停（app-schema.md 规则21）：独立于历史验证结果；
+  # 解除条件是生产契约重新验证通过，不是版本更新。
+  hold:
+    reason:
+      en: "Deployment paused: production database configuration and per-instance encryption setup require verification."
+      zh: "暂停部署：生产数据库配置和每实例加密配置尚待验证。"
   post_deploy:
     admin_path: "/register"
     admin_setup:

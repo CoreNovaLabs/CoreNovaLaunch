@@ -1,4 +1,4 @@
-"""app-schema.md §5 十九条的负向用例：每种越界都必须被拒。"""
+"""app-schema.md §5 各条规则的负向用例：每种越界都必须被拒。"""
 
 from __future__ import annotations
 
@@ -381,3 +381,50 @@ def test_resources_derive(tmp_path):
 def test_tag_template_rendering(tmp_path, tpl, expect):
     spec = make(tmp_path, lambda d: d["deploy"].__setitem__("image_tag_template", tpl))
     assert appspec.render_image_ref(spec, "v6.61.0") == expect
+
+
+def test_rule21_hold_valid_passes(tmp_path):
+    def add_hold(d):
+        d["deployment"]["hold"] = {
+            "reason": {"en": "Deployment paused pending verification.", "zh": "暂停部署：待验证。"},
+        }
+
+    assert errors(tmp_path, add_hold) == []
+
+
+def test_rule21_hold_reason_must_be_bilingual(tmp_path):
+    errs = errors(
+        tmp_path,
+        lambda d: d["deployment"].__setitem__("hold", {"reason": {"en": "paused"}}),
+    )
+    assert any("规则21" in e and "双语" in e for e in errs), errs
+
+
+def test_rule21_hold_rejects_non_mapping(tmp_path):
+    errs = errors(tmp_path, lambda d: d["deployment"].__setitem__("hold", "paused"))
+    assert any("规则21" in e and "映射" in e for e in errs), errs
+
+
+def test_rule21_hold_rejects_extra_keys(tmp_path):
+    errs = errors(
+        tmp_path,
+        lambda d: d["deployment"].__setitem__(
+            "hold",
+            {
+                "reason": {"en": "paused", "zh": "暂停"},
+                "until": "2026-10-01",
+            },
+        ),
+    )
+    assert any("规则21" in e and "额外键" in e for e in errs), errs
+
+
+def test_rule21_hold_rejects_secret_words(tmp_path):
+    errs = errors(
+        tmp_path,
+        lambda d: d["deployment"].__setitem__(
+            "hold",
+            {"reason": {"en": "reset the admin password", "zh": "重置管理员密码"}},
+        ),
+    )
+    assert any("规则21" in e and "敏感词" in e for e in errs), errs

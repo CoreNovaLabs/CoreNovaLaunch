@@ -60,6 +60,12 @@ deployment:
   size: "small"
   documentation_url: "https://learn.netdata.cloud"
   regions: ["us-east-1"]
+  # 运维性部署暂停（app-schema.md 规则21）：独立于历史验证结果；
+  # 解除条件是生产契约重新验证通过，不是版本更新。
+  hold:
+    reason:
+      en: "Deployment paused: host metric mounts and protected dashboard access are not configured."
+      zh: "暂停部署：尚未配置宿主机指标挂载和仪表盘访问保护。"
   post_deploy:
     admin_path: "/"
     admin_setup:

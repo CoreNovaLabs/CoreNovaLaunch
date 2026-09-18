@@ -68,7 +68,8 @@ R2 = Website Runtime Source of Truth
       "monthly_usd": 23,
       "note": { "en": "Verified default: ~$15.2 t3.small + $4 for 50 GB gp3 + $3.65 public IPv4/mo.", "zh": "已验证默认配置：t3.small 约 $15.2 + 50GB gp3 约 $4 + 公网 IPv4 约 $3.65/月。" }
     },
-    "data_path": "/var/lib/ghost/content"
+    "data_path": "/var/lib/ghost/content",
+    "hold": { "reason": { "en": "Deployment paused: …", "zh": "暂停部署：…" } }
   },
 
   "release": {
@@ -155,6 +156,25 @@ Manifest: https://pub-xxxx.r2.dev/screenshots/ghost/v5.75.0/home.png
   当前 t3 档及更高档，数据卷仅显示当前值及其 2× / 4×（且不超过模板上限 4096 GB）。一旦修改，
   界面必须明确标为“自定义配置 / 未单独验证”，不得继续显示该组合已验证，也不得沿用默认配置的
   成本估算；镜像 digest、AMI、数据路径、端口与健康检查仍必须来自所选版本的 Manifest 并保持钉扎。
+
+### 2.5 部署暂停（hold）："已验证"与"当前可部署"是两个状态
+
+`status: verified` 证明的是**历史验证事实**（该版本曾通过全部门禁），不等于**当前允许部署**。
+平台层模板/初始化脚本变更、生产部署核对发现问题等情况下，已发布的应用可能被运维性暂停；
+两者必须分别建模，禁止互相覆盖：
+
+- **事实源**：`apps/*.yaml` 的 `deployment.hold.reason`（app-schema.md §5 规则21，双语必填）。
+- **发布数据**：`current.json` 的 `deploy.hold`（`{ "reason": { en, zh } }`）；由 Manifest 投影链在
+  验证发布时携带，也可由 `scripts/verify/sync_holds.py` 独立条件写（If-Match）进已发布的
+  `current.json` —— **不等下一次验证**，否则"hold 拦住验证 → hold 字段永远进不了发布数据"死锁。
+- **消费规则**：官网任何部署入口（详情页配置器、版本页部署按钮、方案页就绪判定、预渲染 SEO）
+  都必须先判定 hold：存在即拦截 `Deploy on AWS` 并展示双语原因，同时把该应用标注为
+  "Deployment paused" 而非 "Verified"；拦截逻辑集中在 `deploymentHold()`，禁止各页面自行判断。
+- **解除条件**：生产契约重新验证通过（含 AWS 真实部署核对），不是版本更新；解除 = 移除 yaml 里的
+  `hold` 后重跑 `sync_holds.py --app <app>` 清除 `deploy.hold`。
+- **迁移窗口**：R2 旧数据尚无 `deploy.hold` 字段时，官网构建期兜底表（`deploymentSafety.ts`）继续
+  拦截同一组应用；兜底表只允许缩小、不允许扩大与发布数据的差异，一旦发布数据携带 hold 字段，
+  兜底表即冗余（保留以防数据回退）。
 
 ## 3. 字段来源约束（禁止前端猜测）
 
