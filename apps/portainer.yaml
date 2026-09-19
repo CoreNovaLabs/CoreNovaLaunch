@@ -61,12 +61,10 @@ deployment:
   size: "small"
   documentation_url: "https://docs.portainer.io"
   regions: ["us-east-1"]
-  # 运维性部署暂停（app-schema.md 规则21）：独立于历史验证结果；
-  # 解除条件是生产契约重新验证通过，不是版本更新。
-  hold:
-    reason:
-      en: "Deployment paused: the template does not mount the host Docker socket by default; local container management is unavailable."
-      zh: "暂停部署：模板默认不挂载宿主机 Docker socket，不能管理宿主机容器。"
+  # 2026-09-19 部署演练解除了此前的 hold（“模板默认不挂载宿主机 Docker socket”）：
+  # AWS 真实部署实证 DockerSocketAccess=true 参数链路可用（socket 挂载 + Docker API
+  # 29.8.1 连通），docs/deploy-trials-2026-09.md §3.2；默认形态局限与 post_deploy
+  # 指引缺口（setup token、endpoint 向导）记为跟进项（缺陷 B/D/E）。
   post_deploy:
     admin_path: "/#!/init/admin"
     admin_setup:
