@@ -139,6 +139,12 @@ def wait_ready(base_url: str, spec: AppSpec) -> Probe:
     started = time.time()
     last_status, last_detail, headers, text = None, "not attempted", {}, ""
     attempt = 0
+    # 404 快速失败不宜立即生效：应用首启存在“端口已监听、路由尚未挂载完”的窗口
+    # （Nest/Express 等框架先 listen 后挂路由，期间任何路径都 404），nocodb 2026.09.0
+    # 首验即被此误杀（issue #17，pytest 后置通过佐证）。改为连续 404 达到阈值才判
+    # endpoint 错配：错配仍会快速失败（保留防呆），启动窗口内的暂时 404 可恢复。
+    consec_404 = 0
+    CONSEC_404_LIMIT = 10
     while time.time() - started < startup and attempt < max(retries, 1):
         attempt += 1
         try:
@@ -162,10 +168,16 @@ def wait_ready(base_url: str, spec: AppSpec) -> Probe:
         if ok_status and (not contains or contains in text):
             return Probe(True, last_status, "ready", attempt, time.time() - started, headers, text)
         if last_status == 404:
-            # 路径不存在是确定的探针错误，耗满启动窗口没有意义
-            last_detail = "HTTP 404：endpoint 不存在（检查 health_check.endpoint）"
-            break
-        if last_status is not None and 400 <= last_status < 500:
+            consec_404 += 1
+            if consec_404 >= CONSEC_404_LIMIT:
+                # 连续 404 达到阈值：启动窗口早已过去，路径错配是确定性错误
+                last_detail = (f"HTTP 404：endpoint 不存在（连续 {consec_404} 次探测均 404，"
+                               f"检查 health_check.endpoint）")
+                break
+            last_detail = f"HTTP 404：等待应用完成路由挂载（连续第 {consec_404} 次）"
+        elif last_status is not None and 400 <= last_status < 500:
+            # 非 404 的 4xx（401/403 等）说明路由已挂载并应答，此后再 404 才是可疑信号
+            consec_404 = 0
             last_detail = f"HTTP {last_status}：应用已应答但拒绝该请求（多为鉴权/路径问题）"
         time.sleep(interval)
     detail = last_detail if last_status is None else f"HTTP {last_status} ({last_detail})"

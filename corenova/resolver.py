@@ -102,7 +102,15 @@ def pick_release(spec: AppSpec, gh: GitHub | None = None, wanted: str | None = N
     if wanted:
         releases = [r for r in gh.releases(spec.source_repo, per_page=50) if r.get("tag_name") == wanted]
         if not releases:
-            raise ValueError(f"上游 {spec.source_repo} 不存在 release tag {wanted!r}")
+            # semver_latest 的 app_version 是规范化形式（v2.39.8），而上游 tag 带自有
+            # 前缀（如 n8n 的 "n8n@2.39.8"）：精确匹配失败时退回 semver 匹配，否则
+            # 重验/重试永远找不到原 release（issue #16，n8n 连锁 34 次失败的根因）。
+            semver = extract_semver(wanted)
+            if semver:
+                releases = [r for r in gh.releases(spec.source_repo, per_page=50)
+                            if extract_semver(str(r.get("tag_name") or "")) == semver]
+            if not releases:
+                raise ValueError(f"上游 {spec.source_repo} 不存在 release tag {wanted!r}")
         rel = releases[0]
     else:
         try:
