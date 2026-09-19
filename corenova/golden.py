@@ -43,6 +43,10 @@ PLACEHOLDER_AMI_ID = "ami-PENDING-SSM-RESOLVE"
 TEMPLATE_DIR = Path("templates/cloudformation/fixed")
 INIT_DIR = TEMPLATE_DIR / "init"
 TEMPLATES = ("network.yaml", "app.yaml", "canary.yaml")
+# ValidateTemplate / CreateStack 的 TemplateBody API 上限（字节）；超出必须改走
+# TemplateURL（上限 1MB）。2026-09 访问控制与上传参数扩容后 app.yaml 已超限。
+TEMPLATE_BODY_API_LIMIT = 51_200
+TEMP_VALIDATE_PREFIX = "golden-validate"
 ASSET_SOURCES = (
     "00-packages-and-docker-runtime.sh",
     "10-nginx-base.sh",
@@ -762,9 +766,51 @@ def resolve_base_ami(cfg: Config, *, override: str = "", allow_aws: bool = True)
 def validate_templates(aws: Aws) -> list[str]:
     notes: list[str] = []
     for name in TEMPLATES:
-        aws.cfn.validate_template(TemplateBody=template_path(aws.cfg, name).read_text(encoding="utf-8"))
+        _validate_template(aws, name)
         notes.append(f"{name}=ok")
     return notes
+
+
+def _validate_template(aws: Aws, name: str) -> None:
+    """ValidateTemplate 单个模板；超过 TemplateBody API 上限时改走 TemplateURL。
+
+    超限对象临时放到模板桶 golden-validate/ 前缀下（桶策略允许公开 GetObject，
+    CloudFormation 服务才能读到），校验完成/失败都立即删除，不留公开副本。
+    Golden 全局单组（concurrency），固定 key 无并发覆盖风险。
+    """
+    body = template_path(aws.cfg, name).read_text(encoding="utf-8")
+    if len(body.encode("utf-8")) <= TEMPLATE_BODY_API_LIMIT:
+        aws.cfn.validate_template(TemplateBody=body)
+        return
+    bucket = aws.cfg.template_bucket
+    if not bucket:
+        raise RuntimeError(
+            f"{name} 超过 TemplateBody {TEMPLATE_BODY_API_LIMIT} 字节上限，且未配置 "
+            "TEMPLATE_S3_BUCKET（config/verify.yaml template_s3.bucket）→ 无法走 TemplateURL 校验"
+        )
+    from . import template_publish
+
+    key = f"{TEMP_VALIDATE_PREFIX}/{aws.cfg.region}/{name}"
+    region = aws.cfg.template_s3_region
+    # boto3 对 us-east-1 默认解析为全局 s3.amazonaws.com；部分网络环境对该域不稳定，
+    # 显式 regional endpoint（与模板桶同区）避免环境差异。
+    import boto3
+
+    s3 = boto3.client("s3", region_name=region, endpoint_url=f"https://s3.{region}.amazonaws.com")
+    url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
+    try:
+        s3.put_object(
+            Bucket=bucket, Key=key, Body=body.encode("utf-8"),
+            ContentType=template_publish.TEMPLATE_CONTENT_TYPE,
+        )
+        log(f"{name} 超过 TemplateBody 上限 → TemplateURL 校验 s3://{bucket}/{key}")
+        aws.cfn.validate_template(TemplateURL=url)
+    finally:
+        try:
+            s3.delete_object(Bucket=bucket, Key=key)
+        except Exception as exc:  # noqa: BLE001 - 清理失败不得掩盖校验结论
+            log(f"临时校验对象删除失败（不影响门禁；残留对象公开可读，应手动清理 "
+                f"s3://{bucket}/{key}）：{type(exc).__name__}: {exc}")
 
 
 def ensure_network_stack(aws: Aws, stack_name: str) -> str:
