@@ -61,12 +61,9 @@ deployment:
   size: "small"
   documentation_url: "https://docs.gitea.com"
   regions: ["us-east-1"]
-  # 运维性部署暂停（app-schema.md 规则21）：独立于历史验证结果；
-  # 解除条件是生产契约重新验证通过，不是版本更新。
-  hold:
-    reason:
-      en: "Deployment paused pending production public-URL injection verification."
-      zh: "暂停部署：待验证生产公网地址注入。"
+  # 2026-09-19 部署演练解除了此前的 hold（“待验证生产公网地址注入”）：
+  # AWS 真实部署实证 AppUrlEnvironmentName+ExtraEnvironment 注入
+  # GITEA__server__ROOT_URL 生效（docs/deploy-trials-2026-09.md §3.1）。
   post_deploy:
     admin_path: "/"
     admin_setup:
