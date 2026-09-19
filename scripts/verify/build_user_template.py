@@ -8,6 +8,9 @@
   不可变 AMI id。one-click 模板不再回退到“部署时最新”的公共 SSM 参数，避免验证对象
   与用户真正启动的主机漂移。
 
+合并构造与内容 SHA 见 corenova/usertemplate.py（验证流水线用同一实现计算
+template_revision，deployment-contract.md §2.4）。
+
     python scripts/verify/build_user_template.py --out data/templates/corenova-one-click.template.yaml
     python scripts/verify/build_user_template.py --publish-s3   # 追加：发布到公开读桶（深链 URL 源）
 
@@ -17,104 +20,10 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import pathlib
 import sys
 
-import yaml
-
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-FIXED = ROOT / "templates" / "cloudformation" / "fixed"
-
-# app.yaml 里这三个参数表达"挂到已有网络栈"；单栈模板由本模板自己的网络资源取代。
-DROP_PARAMS = ("SubnetId", "SecurityGroupId", "NetworkStackName")
-
-def build() -> dict:
-    net = yaml.safe_load((FIXED / "network.yaml").read_text(encoding="utf-8"))
-    app = yaml.safe_load((FIXED / "app.yaml").read_text(encoding="utf-8"))
-
-    conditions: dict = {}
-    for src in (net, app):
-        for k, v in (src.get("Conditions") or {}).items():
-            conditions[k] = copy.deepcopy(v)
-    resources: dict = {}
-    for name, spec in net["Resources"].items():
-        resources[name] = copy.deepcopy(spec)
-    for name, spec in app["Resources"].items():
-        spec = copy.deepcopy(spec)
-        text = yaml.safe_dump(spec, sort_keys=False)
-        text = (
-            text.replace("Ref: SubnetId\n", "Ref: PublicSubnetA\n")
-            .replace("Ref: SecurityGroupId\n", "Ref: BaseSG\n")
-            .replace("Ref: NetworkStackName\n", "Ref: AWS::StackName\n")
-        )
-        resources[name] = yaml.safe_load(text)
-
-    parameters: dict = {}
-    for src in (net, app):
-        for k, v in src["Parameters"].items():
-            if k in DROP_PARAMS:
-                continue
-            v = copy.deepcopy(v)
-            if k == "TerminationProtection":
-                # 一键评估默认不锁定实例（用户可显式选 Enabled）；三栈生产模板保持 Enabled
-                v["Default"] = "Disabled"
-            parameters[k] = v
-
-    # 一键部署用户只需要入口地址和定位实例的 ID，其余是三栈内部落地细节（噪声）。
-    KEEP_OUTPUTS = {"InstanceId", "PublicIp", "PublicDnsName", "PrivateIp", "ResolvedLaunchUrl"}
-    outputs: dict = {}
-    for src in (net, app):
-        for k, v in (src.get("Outputs") or {}).items():
-            if k not in KEEP_OUTPUTS:
-                continue
-            v = copy.deepcopy(v)
-            # 单栈模板自包含：Export 面向三栈架构（network 被其他栈消费），
-            # 保留会在用户账号里与既有 corenova-network 栈的导出名同名冲突
-            # （"Export with name corenova-network-VpcId is already exported"
-            #   -> CREATE 即回滚，2026-08-31 线上事故）。Outputs 的 Value 照留。
-            v.pop("Export", None)
-            outputs[k] = v
-
-    return {
-        "AWSTemplateFormatVersion": "2010-09-09",
-        "Description": (
-            "CoreNova Launch — one-click deploy of a CoreNova-verified application "
-            "into your own AWS account. Single stack: VPC + SSM-only EC2 host "
-            "(Docker via cfn-init, port 22 closed) running the exact image that "
-            "passed verification. Docs: https://corenova-website.pages.dev/docs/verification"
-        ),
-        "Parameters": parameters,
-        "Conditions": conditions,
-        "Resources": resources,
-        "Outputs": outputs,
-        "Metadata": {
-            "AWS::CloudFormation::Interface": {
-                "ParameterGroups": [
-                    {"Label": {"default": "Application"}, "Parameters": [
-                        "AppName", "ImageReference", "ContainerPort", "HealthCheckPath",
-                        "DataContainerPath", "AppUrlEnvironmentName", "ExtraEnvironment",
-                    ]},
-                    {"Label": {"default": "Host"}, "Parameters": [
-                        "InstanceType", "DiskGb", "DataVolumeSize", "AmiId",
-                    ]},
-                    {"Label": {"default": "访问控制与上传"}, "Parameters": [
-                        "AllowedWebCidr", "HttpIngressCidr", "MaxUploadSizeMb",
-                        "LaunchUrl", "Hostnames", "TlsPemPath", "SelfSignedTls",
-                    ]},
-                    {"Label": {"default": "显式启用的能力（非默认验证配置）"}, "Parameters": [
-                        "DockerSocketAccess", "ExtraTcpPort", "ExtraUdpPort", "ExtraPortIngressCidr",
-                    ]},
-                ],
-                "ParameterLabels": {
-                    "ImageReference": {
-                        "default": "Image (exact tag) — keep the digest-pinned value"
-                    },
-                    "AppName": {"default": "Application name"},
-                },
-            }
-        },
-    }
 
 
 def main() -> int:
@@ -130,11 +39,13 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    tpl = build()
+    from corenova import usertemplate
+
+    tpl = usertemplate.build(ROOT)
     out_path = pathlib.Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
-        yaml.safe_dump(tpl, sort_keys=False, allow_unicode=True, width=10_000),
+        usertemplate.merged_text(ROOT),
         encoding="utf-8",
     )
     print(f"written: {out_path}")

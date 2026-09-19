@@ -55,6 +55,7 @@
 > | `config_revision`   | `config.app_config_revision`             | 应用配置 `apps/{app}.yaml` 的 SHA |
 > | `compose_revision`  | `config.compose_revision`                | compose 文件的 SHA |
 > | `tests_revision`    | `config.tests_revision`                  | 测试脚本 `apps/{app}/tests/**` 的 SHA（§4.3） |
+> | `template_revision` | `config.template_revision`               | one-click 模板合并输出的内容 SHA（deployment-contract.md §2.4） |
 > | `verification_run_id` | 顶层 `verification_run_id`             | — |
 > | `verified_at`       | 顶层 `verified_at`                       | — |
 >
@@ -96,7 +97,8 @@
   "config": {
     "app_config_revision": "git-sha-of-apps/ghost.yaml",
     "compose_revision": "git-sha-of-apps/ghost/docker-compose.yml",
-    "tests_revision": "git-sha-of-apps/ghost/tests"
+    "tests_revision": "git-sha-of-apps/ghost/tests",
+    "template_revision": "content-sha-of-merged-one-click-template"
   },
 
   "verification": {
@@ -223,6 +225,7 @@
 | `release.image_reference` | 由 `deploy.image_tag_template` 渲染 | **不可变** | 本次 `app_version` 对应的**精确**镜像引用，见 §4.1 |
 | `platform.base_ami_source` | Platform Contract | 每次验证变 | `public` \| `custom`（公开 AMI 引导期 vs 自建/收费 AMI 期），见 platform-contract.md §2.1 |
 | `config.tests_revision` | `apps/{app}/tests/**` 的 git SHA（未提交回退内容哈希） | 测试变更时变 | 钉住产生本次 `tests_passed` 的测试版本，见 §4.3 |
+| `config.template_revision` / `website.deploy.template.revision` | one-click 模板合并输出的内容 SHA（未提交回退内容哈希） | 模板源变更时变 | 钉住产生本次证据的部署模板版本，对账 `deploy.template`，见 deployment-contract.md §2.4 |
 | `website.features` / `website.deploy.docker_image` / `website.release.type_evidence` / `website.workflow_run_url` | app schema + 运行时解析 | 投影 | 前端直接消费的字段，必须由生成器从顶层/artifacts 投影，禁止手写第二份 |
 
 ### 4.1 版本 ↔ 镜像绑定证明（强制）

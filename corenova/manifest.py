@@ -11,8 +11,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import usertemplate
 from .appspec import AppSpec
 from .resolver import ResolvedImage, ResolvedVersion
+from .template_publish import public_template_url
 from .util import file_sha, git_revision, sanitize_for_id, utcnow
 
 IDENTITY_IN_WEBSITE = (
@@ -82,6 +84,18 @@ def build(
     instance_type, data_volume_gb = spec.resources()
     region = str(platform.get("region") or cfg.region)
 
+    # 模板-证据绑定（deployment-contract.md §2.4）：记录验证时用户模板的内容 SHA。
+    # 模板由 publish-template.yml 单对象覆盖发布（无版本号对象键），时间戳无法
+    # 回答“这份证据对应的模板是哪版”，内容哈希可以；current.json 随证据发布后，
+    # 模板与证据是否匹配可查，新验证自动绑定新 revision。模板源缺失时省略键
+    # （与其他可选投影同规则；真实流水线的仓库 root 必有 templates/）。
+    tpl_revision = usertemplate.revision(root) if usertemplate.fixed_dir(root).is_dir() else ""
+    tpl_bucket = getattr(cfg, "template_bucket", "")
+    tpl_url = (
+        public_template_url(tpl_bucket, cfg.template_s3_region)
+        if tpl_bucket and tpl_revision else ""
+    )
+
     shots = [
         {
             "scenario": s["slug"],
@@ -130,6 +144,9 @@ def build(
             "health_check_path": spec.g("health_check.endpoint", "/"),
             "docker_image": image.image_ref,
             "extra_environment": spec.g("deploy.extra_environment") or [],
+            # 深链模板与证据的绑定：官网展示“验证所用模板”，用户可核对深链
+            # templateURL 内容与验证证据的对应关系（部署不猜，对得上）。
+            **({"template": {"url": tpl_url, "revision": tpl_revision}} if tpl_revision else {}),
         },
         "release": {
             "type": resolved.release_type,
@@ -196,6 +213,7 @@ def build(
             "app_config_revision": file_sha(spec.path),
             "compose_revision": file_sha(root / spec.g("deploy.compose_file")),
             "tests_revision": git_revision(root / spec.g("tests.predefined_dir"), root),
+            **({"template_revision": tpl_revision} if tpl_revision else {}),
         },
         "verification": {
             "application": outcome.verification.get("application", "failed"),
@@ -266,6 +284,8 @@ def assert_projection(manifest: dict[str, Any]) -> None:
         raise AssertionError("website.health 必须等于 verification.application 的投影")
     if w["deploy"]["docker_image"] != manifest["container"]["image"]:
         raise AssertionError("website.deploy.docker_image 必须等于 container.image")
+    if (w["deploy"].get("template") or {}).get("revision") != manifest["config"].get("template_revision"):
+        raise AssertionError("website.deploy.template.revision 必须等于 config.template_revision（或同时省略）")
 
 
 def screenshot_key(app: str, app_version: str, filename: str) -> str:

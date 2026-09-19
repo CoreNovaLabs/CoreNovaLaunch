@@ -142,15 +142,21 @@ Manifest: https://pub-xxxx.r2.dev/screenshots/ghost/v5.75.0/home.png
 `Generate Template` 深链的 `templateURL` 指向 Repo C 发布的公开读 S3 直链
 `https://<bucket>.s3.us-east-1.amazonaws.com/corenova-one-click.template.yaml`（CloudFormation 控制台原生支持，一点即进创建向导）：
 
-- 模板由 Repo C `scripts/verify/build_user_template.py` 从 `templates/cloudformation/fixed/*.yaml` 合成，
-  `publish-template.yml` 在 fixed 栈变化时发布；`corenova/template_publish.py` put 后以**匿名 GET 探测**，
-  不可读即失败（与 §2.3 镜像失败即构建失败同一精神：深链绝不指向读不到的对象）。
-- 模板 URL 是**基础设施配置**而非验证证据 -> **不进** `current.json` / Manifest；Repo A 以构建期常量引用
-  （`src/lib/deploy.ts`，`VITE_ONE_CLICK_TEMPLATE_URL` 可覆盖），默认值必须与 Repo C `TEMPLATE_S3_BUCKET`
-  指向同一只桶（repo-structure.md §4.4）。
+- 模板由 Repo C `scripts/verify/build_user_template.py` 从 `templates/cloudformation/fixed/*.yaml` 合成
+  （合并构造与内容 SHA 见 `corenova/usertemplate.py`），`publish-template.yml` 在 fixed 栈变化时发布；
+  `corenova/template_publish.py` put 后以**匿名 GET 探测**，不可读即失败（与 §2.3 镜像失败即构建失败
+  同一精神：深链绝不指向读不到的对象）。
+- **模板-证据绑定**：模板以**单对象覆盖**发布（无版本号对象键），时间戳无法回答“这份证据对应的
+  模板是哪版”。因此每次验证必须计算合并输出的内容 SHA（`usertemplate.revision`，前 40 hex）并写入
+  `config.template_revision`，同值投影到 `current.json` 的 `deploy.template.revision`（附带发布 URL
+  `deploy.template.url` 用于对账）。深链入口仍是 Repo A 构建期常量（见下条），`deploy.template` 仅作
+  证据对账，不作为深链源。模板再次发布不使既有证据失效（镜像 digest 与 AMI 已分别钉扎）；
+  新验证自动绑定新 revision，模板与证据是否匹配由此可查，而非靠发布时间猜。
 - 默认深链必须把当前记录的 `ami_id`、`deploy.instance_type`、`deploy.data_volume_gb`、
   `deploy.data_path`、`deploy.health_check_path`、`deploy.app_url_env_name` 与 digest-pinned
-  `deploy.docker_image` 完整映射到 CloudFormation 参数。缺任一强制值时 Deploy 按钮必须禁用并提示
+  `deploy.docker_image` 完整映射到 CloudFormation 参数；深链的 `templateURL` 由 Repo A 构建期常量引用
+  （`src/lib/deploy.ts`，`VITE_ONE_CLICK_TEMPLATE_URL` 可覆盖），默认值必须与 Repo C `TEMPLATE_S3_BUCKET`
+  指向同一只桶（repo-structure.md §4.4）。缺任一强制值时 Deploy 按钮必须禁用并提示
   “需要重新验证”，不得退回模板默认值后仍称为已验证部署。
 - 详情页允许用户在该基线上**主动上调** `InstanceType` 和 `DataVolumeSize`，但不得下调：实例仅显示
   当前 t3 档及更高档，数据卷仅显示当前值及其 2× / 4×（且不超过模板上限 4096 GB）。一旦修改，
@@ -180,8 +186,9 @@ Manifest: https://pub-xxxx.r2.dev/screenshots/ghost/v5.75.0/home.png
 
 | 网站展示项 | 来源字段 | 是否允许前端推断 |
 |-----------|---------|----------------|
-| Deploy 按钮深链 | §2.4 构建期常量模板 URL + 已验证 `deploy.docker_image`（tag@digest 钉扎） | ❌ 镜像引用必须来自 Manifest；模板 URL 不得拼站点 origin / 自托管副本 |
-| one-click 深链 templateURL | 构建期常量（§2.4 公开 S3 直链） | ❌ 不得拼站点 origin / 自托管副本 |
+| Deploy 按钮深链 | §2.4 构建期常量模板 URL + 已验证 `deploy.docker_image`（tag@digest 钉扎） | ❌ 镜像引用必须来自 Manifest；模板 URL 不得拼站点 origin /  自托管副本 |
+| one-click 深链 templateURL | 构建期常量（§2.4 公开 S3 直链）；`deploy.template.url` 仅作证据对账 | ❌ 深链不得改读 `deploy.template`；证据 URL 不得拼站点 origin |
+| 模板-证据对应关系 | `current.json` 的 `deploy.template.revision`（验证时合并输出内容 SHA，§2.4） | ❌ 不得以发布时间戳代替；旧记录无此键表示早于字段引入 |
 | 文档链接 | `deploy.documentation_url` | ❌ 必须来自 Manifest |
 | 支持区域 | `deploy.regions` | ❌ 必须来自 Manifest |
 | 更新类型徽章（New Version / Security Update） | `release.type` | ❌ **必须来自数据**，前端不得按版本号猜 |
