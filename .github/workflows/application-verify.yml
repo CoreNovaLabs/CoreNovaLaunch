@@ -84,6 +84,8 @@ jobs:
       AWS_REGION: ${{ secrets.AWS_REGION }}
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      # one-click 模板桶名：manifest 的 deploy.template.url 需要（模板-证据绑定，deployment-contract §2.4）
+      TEMPLATE_S3_BUCKET: ${{ secrets.TEMPLATE_S3_BUCKET }}
       GITHUB_TOKEN: ${{ github.token }}   # resolver / 台账走认证请求，避免匿名 API 限流
     steps:
       # 空值防护必须在工作流最开始（state-machine §5）：
