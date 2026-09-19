@@ -140,11 +140,64 @@ portainer-2.45.1-20260919-003（revision f14bc41776…，url 双字段齐）。
 
 ### 3.3 vaultwarden 1.37.3（基线）
 
-（待填，同上结构）
+栈 `corenova-vaultwarden-1-37-3`（08055f10-b427），实例 i-04d405fb85e072545，
+公网 `ec2-13-218-151-55.compute-1.amazonaws.com`；参数与官网深链等价 +
+AllowedWebCidr + LogGroup 覆盖。重验证据：vaultwarden-1.37.3-20260919-003。
+
+部署两次失败后第三次成功，失败原因均非模板逻辑：①缺陷 A（LogGroup 默认值
+冲突，脚本沉淀覆盖参数后解决）；②缺陷 G（VPC/IGW 配额满，删除已完成演练的
+gitea 栈腾出配额后解决）。
+
+1. **首次登录（注册 + 登录）**：Bitwarden 协议要求客户端侧加密材料
+   （PBKDF2 10 万轮 + HKDF-Expand + AES-256-CBC/HMAC + RSA-2048），用 Node
+   内置 crypto 实现零依赖脚本（scripts/dev/vw-register.mjs）→
+   `POST /identity/accounts/register` HTTP 200 →
+   `POST /identity/connect/token` HTTP 200（Bearer）。
+2. **核心操作**：用 token 创建加密文件夹（cipherString `2.iv|ct|mac`）→
+   HTTP 200，id `3cf4744f-e244-4260-a548-30eac9d4105e`——E2E 加密数据
+   写入 SQLite 实证。
+3. **重启数据保留**：stop/start → 新 IP 54.146.129.53（缺陷 C 第三次复现）
+   → `/alive` 首次探测即 200（就绪最快）→ 登录 200 → GET 同 id 文件夹
+   HTTP 200。
+4. **备份恢复**：宿主打包数据卷 `12840 B`；db.sqlite3 sha256
+   `58dd529b…`（盘上 = 备份内一致）→ 停容器 → `rm db.sqlite3` 模拟丢失
+   → 解包恢复 → hash 一致 → 起容器 → 登录 200 + 文件夹 GET 200（数据
+   完整恢复）。基础设施级：EBS 快照 snap-0e98f9c41dad5c1a4
+   （vol-0e35c8d5b974066c9，DeleteAfter 2026-10-19）。
+
+附：模板没有给 vaultwarden 注入 `ADMIN_TOKEN`，`/admin` 管理面板不可用——
+深链等价参数下的预期行为，普通用户注册/登录路径完全可用；若需管理面板
+应在部署时追加环境变量（深链 ExtraEnvironment 通道支持）。
 
 ## 4. 结论与跟进
 
-（待填：用户能否独立完成全流程、发现的摩擦点、对官网指引的改进项）
+**完成度**：三个代表应用全部走完五环节（部署 → 首次登录 → 核心操作 →
+重启数据保留 → 备份恢复），无一项需人工干预部署栈之外的基础设施：
+
+| 应用 | 部署 | 首次登录 | 核心操作 | 重启保留 | 备份恢复 | hold |
+|------|------|----------|----------|----------|----------|------|
+| gitea | ✓（缺陷 A 绕过） | ✓ 安装向导 | ✓ 建仓+push | ✓ | ✓+快照 | 已解除 |
+| portainer | ✓ | ✓（缺陷 D 绕过） | ✓ socket 实证 | ✓ | ✓ | 已解除 |
+| vaultwarden | ✓（缺陷 A+G 后） | ✓ 注册+登录 | ✓ 加密文件夹 | ✓ | ✓+快照 | 无 |
+
+**用户能否独立完成**：能，但每个环节都存在真实摩擦点（A-G，台账见 §5）。
+其中 P1 三项（A 缺陷 A、B、E）会让部分用户在首次部署、portainer 可用性、
+参数修改三个场景下失败或困惑，需优先跟进。
+
+**官网/模板改进项（按优先级）**：
+1. 缺陷 A：模板 LogGroup 默认值改 `Fn::Sub`（需重跑 Golden + 重发布）。
+2. 缺陷 B：app-schema 增 `deploy.docker_socket` 字段 → portainer 声明 →
+   深链映射 DockerSocketAccess（含 compose 重验）。
+3. 缺陷 E：实例级参数的修改语义（UpdateReplaceInstances 或指引明示需重建）。
+4. 缺陷 D：portainer `admin_setup` 补 setup token 步骤；同步补
+   vaultwarden ADMIN_TOKEN 可选注入说明。
+5. 缺陷 C/G：DeployGuide 提示 EIP 绑定与 VPC/IGW 配额。
+
+**模板-证据错配闭环**：三个应用的 `current.json` 均已绑定
+`deploy.template.{url,revision}`（revision `f14bc41776…`，与公开桶模板一致），
+官网 DeployGuide 已展示绑定信息（website 1f331a4）。两个 CI 工作流
+（golden-verify/application-verify）均已注入 TEMPLATE_S3_BUCKET，后续
+验证自动携带模板绑定。
 
 ## 5. 演练中发现的产品缺陷（跟进台账）
 
@@ -208,3 +261,14 @@ portainer-2.45.1-20260919-003（revision f14bc41776…，url 双字段齐）。
 - 本次演练处置：SSM 手动 export CFNOVA_* 后重跑
   `/opt/corenova/bin/30-app-container.sh` + systemctl restart 生效；注意手动
   路径在 export 变量集不完整时会引入二次配置漂移，只能作为演练级临时手段。
+
+### 缺陷 G（P2）：每栈独立 VPC+IGW，默认配额（5）下第三个栈即撞上限
+
+- 现象：vaultwarden 栈创建时 `The maximum number of VPCs has been reached` /
+  `maximum number of internet gateways`（ServiceLimitExceeded）→ ROLLBACK
+  COMPLETE，且控制台无资源级提示，用户难以自助定位到配额原因。
+- 根因：模板为每栈创建独立 VPC+IGW（隔离设计），新账户默认 VPC 配额 5
+  （默认 VPC + Golden canary 遗留 + 2 个用户栈即满）。
+- 修复方向：DeployGuide 提示“多应用部署需先提升 VPC/IGW 配额或分区域”；
+  模板可在错误响应上留文档链接（CFN hook 失败信息可定制）。
+- 本次演练处置：删除已完成演练的 gitea 栈腾出配额后重试成功。
