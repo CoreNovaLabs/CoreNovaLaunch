@@ -58,6 +58,8 @@ deployment:
   size: "small"
   documentation_url: "https://nodered.org/docs/"
   regions: ["us-east-1"]  # v1 单区域（规则14）
+  production_contract:
+    checks: ["data_dir_write", "admin_auth"]
   # 运维性部署暂停（app-schema.md 规则21）：独立于历史验证结果；
   # 解除条件是生产契约重新验证通过，不是版本更新。
   hold:

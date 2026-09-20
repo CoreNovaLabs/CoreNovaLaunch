@@ -121,6 +121,9 @@ deployment:                           # required, 网站展示用的静态部署
                                       # 是 CFN DataContainerPath 参数的真相源；必须以 / 开头（§5 规则19）
   app_url_env_name: "url"             # optional, string；接收公开访问 URL 的应用原生环境变量名
                                       # （Ghost 为 url）；值由 CFN 按 LaunchUrl/PublicDnsName 注入（规则20）
+  production_contract:                # optional, L1.5 生产核对声明（规则22，deployment-contract.md §2.6）：
+                                      # 新版本发布后在真实 AWS 一次性栈上逐项实证，全过即自动解除 hold
+    checks: ["admin_auth", "data_dir_write"]  # 非空、去重，值 ∈ {admin_auth, data_dir_write, url_injection, host_metrics}
   hold:                               # optional, 运维性部署暂停（规则21）：独立于历史验证结果，
                                       # “已验证”≠“当前可部署”；官网拦截所有部署入口并展示原因。
                                       # 解除条件是生产契约重新验证通过（不是版本更新），移除后重跑 sync_holds
@@ -185,6 +188,7 @@ website:                              # required
 | `deployment.cost_estimate.note` | ❌ | Localized | `null` | 估算口径说明；若存在 `en`/`zh` 均非空；含敏感词即校验失败 |
 | `deployment.data_path` | stateful_app 必填 | string | `null` | 容器内数据挂载目录，必须以 `/` 开头；与 compose 文件容器目标一致，是 CFN `DataContainerPath` 的真相源 |
 | `deployment.app_url_env_name` | ❌ | string | `null` | 接收公开访问 URL 的应用原生环境变量名；必须匹配 `^[A-Za-z_][A-Za-z0-9_]*$` |
+| `deployment.production_contract.checks` | ❌ | string[] | `null` | L1.5 生产核对声明；非空、去重，每项 ∈ {`admin_auth`,`data_dir_write`,`url_injection`,`host_metrics`}（规则22） |
 | `release_type_override` | ❌ | enum | `null` | 非空时必须带 `# reason:`（deployment-contract.md §4.1） |
 | `website.featured` | ✅ | bool | — | — |
 | `website.tags` | ✅ | string[] | — | 非空 |
@@ -289,6 +293,7 @@ health_check:
 19. `stateful_app` 必须声明 `deployment.data_path`；其他类型若声明也必须为以 `/` 开头的字符串；含空格或 shell 元字符（`;&|`$`）则校验失败。该值必须与应用 compose 文件的容器挂载目标一致——它是 CFN `DataContainerPath` 参数的唯一真相源，compose / CFN / extra_environment 三处不得各自硬编码导致漂移。
 20. `deployment.app_url_env_name` 若存在，必须匹配 `^[A-Za-z_][A-Za-z0-9_]*$`。它只声明应用原生变量名；变量值由 CloudFormation 在启动时根据显式 `LaunchUrl` 或实例 `PublicDnsName` 生成，禁止 app schema、前端或模板写死部署地址。
 21. `deployment.hold` 若存在：必须是映射且仅含 `reason` 键；`reason` 的 `en`/`zh` 均非空，且含 `secret`/`password`/`token`/`private_key`（不区分大小写）即校验失败。hold 是**运维性部署暂停**，独立于验证结果（`status: verified` 的应用也可能被 hold）；声明后投影进 `current.json` 的 `deploy.hold`，官网以此拦截全部部署入口。发布与解除走 `scripts/verify/sync_holds.py`（条件写，不动 versions/、index 与任何验证字段），不等下一次验证——否则“hold 拦住验证 → hold 字段永远进不了发布数据”死锁。
+22. `deployment.production_contract` 若存在：必须是映射且仅含 `checks` 键；`checks` 为非空、无重复的 string[]，每项 ∈ {`admin_auth`, `data_dir_write`, `url_injection`, `host_metrics`}。它是 L1.5 生产核对的声明式清单（deployment-contract.md §2.6）：新版本发布后 `production-verify.yml` 在真实 AWS 一次性栈上逐项实证，全过即自动删除 `deployment.hold`（解除的唯一自动化路径）；核对项同时决定深链必须携带的模板参数（`admin_auth`→`AdminAuthEnabled`、`host_metrics`→`HostMetricsAccess`），投影为 `current.json` 的 `deploy.production_contract.checks`。`checks` 含 `data_dir_write` 时应用必须声明 `deployment.data_path`（规则19）；含 `url_injection` 时必须存在注入通道——`deployment.app_url_env_name`（规则20）或含 `${CORENOVA_APP_URL}` 占位符的 `deploy.extra_environment`，二者皆无则核对没有对象可测，校验失败。
 
 ## 6. 反模式
 
@@ -306,6 +311,7 @@ health_check:
 - ❌ 前端猜测应用接收公开 URL 的变量名，或在 `extra_environment` 写死主机名（必须来自 `deployment.app_url_env_name`，规则 20）。
 - ❌ 把 `ami_id` / `region` 写进 app schema（那是平台层契约，归 Platform Contract）。
 - ❌ 用版本重新验证代替暂停解除：`deployment.hold` 的解除条件是生产契约重新验证通过，验证流水线也不负责写入 hold（那是 sync_holds 的运维路径，规则 21）。
+- ❌ 把 hold 的解除寄托于人工反复演练而不声明 `production_contract`：核对项可枚举的应用必须走 L1.5 自动化（规则 22），否则"自动更新即可部署"永远闭不了环。
 
 ## 7. 部署模型边界：当前为单容器（2026-08-30 明确）
 

@@ -177,10 +177,36 @@ Manifest: https://pub-xxxx.r2.dev/screenshots/ghost/v5.75.0/home.png
   都必须先判定 hold：存在即拦截 `Deploy on AWS` 并展示双语原因，同时把该应用标注为
   "Deployment paused" 而非 "Verified"；拦截逻辑集中在 `deploymentHold()`，禁止各页面自行判断。
 - **解除条件**：生产契约重新验证通过（含 AWS 真实部署核对），不是版本更新；解除 = 移除 yaml 里的
-  `hold` 后重跑 `sync_holds.py --app <app>` 清除 `deploy.hold`。
-- **迁移窗口**：R2 旧数据尚无 `deploy.hold` 字段时，官网构建期兜底表（`deploymentSafety.ts`）继续
-  拦截同一组应用；兜底表只允许缩小、不允许扩大与发布数据的差异，一旦发布数据携带 hold 字段，
-  兜底表即冗余（保留以防数据回退）。
+  `hold` 后重跑 `sync_holds.py --app <app>` 清除 `deploy.hold`。该重新核对已由 L1.5 生产核对门禁
+  （§2.6）自动化：核对全绿即由 `production-verify.yml` 删 hold 并触发 sync-holds。
+- **迁移窗口（已关闭，2026-09-20）**：R2 旧数据尚无 `deploy.hold` 字段时，官网构建期兜底表
+  （`deploymentSafety.ts`）曾继续拦截暂停应用；兜底表只允许缩小。现所有已发布
+  `current.json` 均携带该字段，兜底表清空为**永久禁止再添加条目**——L1.5（§2.6）从 Repo C
+  自动解除 hold 时无法同步修改 Repo A 的构建期表，残留条目会在暂停已解除后继续静默拦截官网。
+
+### 2.6 L1.5 生产核对门禁（production check）："验证通过"到"可部署"的自动化桥
+
+本地应用验证（compose + Playwright）不接触 AWS，永远产不出"生产语义正确"的证据，
+hold 因此无法靠版本更新解除。L1.5 把这条核对自动化：新版本发布后，在真实 AWS 建一个
+**一次性用户栈**（与用户经深链部署的同一份公开模板、同一 digest 钉扎镜像），逐项实证后删栈。
+
+- **声明**：`apps/*.yaml` 的 `deployment.production_contract.checks`（app-schema.md 规则22），
+  取值子集：`admin_auth`（整站 Basic 保护：无凭据 401、带凭据 200）、`data_dir_write`
+  （以镜像声明用户向数据卷写删文件）、`url_injection`（URL 环境变量注入生效）、
+  `host_metrics`（宿主机指标只读挂载可用）。核对结论由 `corenova/prodcheck.py` 写入
+  `data/runs/prodcheck-*.json` 证据。
+- **解除闭环**：全部 checks 通过 → `production-verify.yml` 删除该应用 yaml 的 `hold`
+  并 push（sync-holds.yml 自动清 R2 `deploy.hold`）；任一失败 → 不碰 yaml，hold 保持。
+  人工解除路径仍然有效（演练实证，如 gitea/portainer 2026-09-19）。
+- **深链联动**：核对项决定模板参数——`admin_auth` 对应 `AdminAuthEnabled=true`、
+  `host_metrics` 对应 `HostMetricsAccess=true`。Manifest 把声明投影为
+  `current.json` 的 `deploy.production_contract.checks`，官网深链必须按声明携带对应参数，
+  否则部署形态退回核对前的未保护基线（§3 表）。
+- **成本与卫生**：栈名 `corenova-prodcheck-<app>-<version>-<run>`，打 tag
+  `corenova:prodcheck=true`；无论成败 finally 删栈并扫残留数据卷；密码只存在于核对进程内存，
+  证据与日志一律脱敏。
+- **边界**：L1.5 不改变九项验证 check 的语义，也不是发布门禁——发布照常，
+  它只决定 hold 的解除；未声明 `production_contract` 的应用不受影响。
 
 ## 3. 字段来源约束（禁止前端猜测）
 
@@ -189,6 +215,7 @@ Manifest: https://pub-xxxx.r2.dev/screenshots/ghost/v5.75.0/home.png
 | Deploy 按钮深链 | §2.4 构建期常量模板 URL + 已验证 `deploy.docker_image`（tag@digest 钉扎） | ❌ 镜像引用必须来自 Manifest；模板 URL 不得拼站点 origin /  自托管副本 |
 | one-click 深链 templateURL | 构建期常量（§2.4 公开 S3 直链）；`deploy.template.url` 仅作证据对账 | ❌ 深链不得改读 `deploy.template`；证据 URL 不得拼站点 origin |
 | 模板-证据对应关系 | `current.json` 的 `deploy.template.revision`（验证时合并输出内容 SHA，§2.4） | ❌ 不得以发布时间戳代替；旧记录无此键表示早于字段引入 |
+| 深链保护参数（AdminAuthEnabled / HostMetricsAccess） | `current.json` 的 `deploy.production_contract.checks`（§2.6） | ❌ 前端不得按应用名猜；无该字段的旧记录不携带保护参数 |
 | 文档链接 | `deploy.documentation_url` | ❌ 必须来自 Manifest |
 | 支持区域 | `deploy.regions` | ❌ 必须来自 Manifest |
 | 更新类型徽章（New Version / Security Update） | `release.type` | ❌ **必须来自数据**，前端不得按版本号猜 |

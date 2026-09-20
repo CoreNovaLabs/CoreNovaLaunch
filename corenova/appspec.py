@@ -389,6 +389,44 @@ def validate(spec: AppSpec, root: Path, platform_region: str) -> list[str]:
             if unexpected:
                 e.append(f"规则21: deployment.hold 不允许额外键 {unexpected}")
 
+    # 22 deployment.production_contract：L1.5 生产核对声明（deployment-contract.md §2.6）。
+    # checks 同时决定一次性栈要实证什么、深链必须携带哪些保护参数；声明了依赖 data_path /
+    # app_url_env_name 的核对项却没声明字段本身，核对就没有对象可测。
+    pc = g("deployment.production_contract")
+    if pc is not None:
+        if not isinstance(pc, dict):
+            e.append(f"规则22: deployment.production_contract 必须是映射，实为 {type(pc).__name__}")
+        else:
+            unexpected = sorted(set(pc) - {"checks"})
+            if unexpected:
+                e.append(f"规则22: deployment.production_contract 不允许额外键 {unexpected}")
+            checks = pc.get("checks")
+            allowed = {"admin_auth", "data_dir_write", "url_injection", "host_metrics"}
+            if (
+                not isinstance(checks, list)
+                or not checks
+                or len(set(checks)) != len(checks)
+                or not set(checks) <= allowed
+            ):
+                e.append(
+                    f"规则22: production_contract.checks 必须是 {sorted(allowed)} 的去重非空子集，实为 {checks!r}"
+                )
+            else:
+                if "data_dir_write" in checks and not g("deployment.data_path"):
+                    e.append("规则22: checks 含 data_dir_write 必须同时声明 deployment.data_path（规则19）")
+                if "url_injection" in checks:
+                    # 注入通道二选一：应用原生变量（规则20）或 extra env 的 ${CORENOVA_APP_URL}
+                    # 占位符（模板展开）；两条都是已验证形态，不得强制应用改声明方式。
+                    has_placeholder = any(
+                        "${CORENOVA_APP_URL}" in str(item)
+                        for item in (g("deploy.extra_environment") or [])
+                    )
+                    if not g("deployment.app_url_env_name") and not has_placeholder:
+                        e.append(
+                            "规则22: checks 含 url_injection 必须声明 deployment.app_url_env_name"
+                            "（规则20）或含 ${CORENOVA_APP_URL} 的 extra_environment 占位注入"
+                        )
+
     # tests 目录
     tdir = g("tests.predefined_dir")
     if not tdir:

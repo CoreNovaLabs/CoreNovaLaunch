@@ -16,6 +16,7 @@ LOG_GROUP="${CFNOVA_LOG_GROUP:-/corenova/apps}"
 AWS_REGION="${CFNOVA_AWS_REGION:-us-east-1}"
 ENV_FILE="/opt/corenova/env/${APP_NAME}.env"
 DOCKER_SOCKET_ACCESS="${CFNOVA_DOCKER_SOCKET_ACCESS:-false}"
+HOST_METRICS_ACCESS="${CFNOVA_HOST_METRICS_ACCESS:-false}"
 EXTRA_TCP_PORT="${CFNOVA_EXTRA_TCP_PORT:-0}"
 EXTRA_UDP_PORT="${CFNOVA_EXTRA_UDP_PORT:-0}"
 
@@ -25,6 +26,14 @@ case "$DOCKER_SOCKET_ACCESS" in
   true)
     [ -S /var/run/docker.sock ] || { echo '[corenova] Docker socket 不存在'; exit 1; }
     EXTRA_ARGS="--mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock"
+    ;;
+  false) ;;
+  *) exit 1 ;;
+esac
+case "$HOST_METRICS_ACCESS" in
+  true)
+    # 宿主机指标只读挂载（netdata 约定 /host 前缀）；不暴露任何可写宿主路径。
+    EXTRA_ARGS="$EXTRA_ARGS -v /proc:/host/proc:ro -v /sys:/host/sys:ro -v /etc/localtime:/etc/localtime:ro"
     ;;
   false) ;;
   *) exit 1 ;;

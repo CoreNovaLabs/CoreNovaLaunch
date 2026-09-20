@@ -183,6 +183,13 @@ def build(
     if isinstance(hold, dict) and isinstance(hold.get("reason"), dict) and hold["reason"].get("en"):
         website["deploy"]["hold"] = {"reason": hold["reason"]}
 
+    # L1.5 生产核对声明（app-schema.md 规则22）：注册了才投影，无声明时省略键
+    # （同 template_revision 的省略规则）。官网据此解释“何时解除暂停”，核对闭环
+    # （production-verify.yml）也以这份清单为门禁输入。
+    contract = spec.g("deployment.production_contract")
+    if isinstance(contract, dict) and isinstance(contract.get("checks"), list) and contract["checks"]:
+        website["deploy"]["production_contract"] = {"checks": [str(c) for c in contract["checks"]]}
+
     manifest: dict[str, Any] = {
         "schema_version": "1.0",
         "verification_id": vid,
@@ -286,6 +293,15 @@ def assert_projection(manifest: dict[str, Any]) -> None:
         raise AssertionError("website.deploy.docker_image 必须等于 container.image")
     if (w["deploy"].get("template") or {}).get("revision") != manifest["config"].get("template_revision"):
         raise AssertionError("website.deploy.template.revision 必须等于 config.template_revision（或同时省略）")
+    # production_contract 只允许这一种形状（或省略键）：current.json 是展示与
+    # 核对门禁的共同事实源，出现第二种形状即说明有人绕过了投影器。
+    pc = w["deploy"].get("production_contract")
+    if pc is not None and (
+        not isinstance(pc, dict) or set(pc) != {"checks"}
+        or not isinstance(pc["checks"], list) or not pc["checks"]
+        or not all(isinstance(c, str) and c for c in pc["checks"])
+    ):
+        raise AssertionError("website.deploy.production_contract 必须为 {checks: [非空字符串…]}（未声明时省略键）")
 
 
 def screenshot_key(app: str, app_version: str, filename: str) -> str:

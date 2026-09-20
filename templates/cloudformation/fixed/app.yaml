@@ -175,6 +175,22 @@ Parameters:
     Description: >
       显式挂载宿主机 Docker socket（例如 Portainer 管理本机）。相当于授予宿主机 root 权限，
       默认关闭；启用前必须限制管理入口并完成认证，不属于默认验证范围。
+  AdminAuthEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      为整个 Web 入口启用 HTTP Basic 管理保护。用户 corenova，随机密码写入
+      /opt/corenova/credentials/admin.txt（root 0600，经 Session Manager 查看；
+      栈更新复用既有密码不重置）。本机 SSM 转发与健康探针免认证；
+      远程访问仍需通过 AllowedWebCidr。管理界面即全部功能的实例建议开启。
+  HostMetricsAccess:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      只读挂载宿主机指标目录（/proc、/sys、/etc/localtime 到 /host/ 前缀，
+      netdata 约定）。默认关闭；开启不暴露任何可写宿主路径。
   ExtraTcpPort:
     Type: Number
     Default: 0
@@ -469,6 +485,8 @@ Resources:
                     export CFNOVA_ALLOWED_WEB_CIDR="${AllowedWebCidr}"
                     export CFNOVA_MAX_BODY_MB="${MaxUploadSizeMb}"
                     export CFNOVA_DOCKER_SOCKET_ACCESS="${DockerSocketAccess}"
+                    export CFNOVA_ADMIN_AUTH="${AdminAuthEnabled}"
+                    export CFNOVA_HOST_METRICS_ACCESS="${HostMetricsAccess}"
                     export CFNOVA_EXTRA_TCP_PORT="${ExtraTcpPort}"
                     export CFNOVA_EXTRA_UDP_PORT="${ExtraUdpPort}"
                     export CFNOVA_LOG_GROUP="${CloudWatchLogGroupName}"
@@ -556,10 +574,13 @@ Resources:
                 SELF_SIGNED_TLS="${CFNOVA_SELF_SIGNED_TLS:-false}"
                 ALLOWED_WEB_CIDR="${CFNOVA_ALLOWED_WEB_CIDR:-127.0.0.1/32}"
                 MAX_BODY_MB="${CFNOVA_MAX_BODY_MB:-100}"
+                ADMIN_AUTH="${CFNOVA_ADMIN_AUTH:-false}"
 
                 # 默认仅允许 SSM 转发后的本机访问；不信任客户端提供的转发地址。
                 python3 -c 'import ipaddress, sys; ipaddress.IPv4Network(sys.argv[1], strict=False)' "$ALLOWED_WEB_CIDR"
                 [[ "$MAX_BODY_MB" =~ ^[1-9][0-9]{0,4}$ ]] && (( MAX_BODY_MB <= 10240 )) || exit 1
+                # 仅允许结构化选项，与 DockerSocketAccess 同一防注入纪律。
+                case "$ADMIN_AUTH" in true|false) ;; *) exit 1 ;; esac
 
                 install -d -m 0755 /etc/nginx/tls /var/log/nginx
                 DEBIAN_FRONTEND=noninteractive apt-get install -y nginx logrotate || {
@@ -587,6 +608,29 @@ Resources:
 
                 # HTTP 与 HTTPS 使用同一组代理、上传和访问控制指令，避免两条入口漂移。
                 install -d -m 0755 /etc/nginx/snippets
+
+                # 管理保护：整站 HTTP Basic。凭据只在首次生成后复用（栈更新不换密码）；
+                # 本机（SSM 端口转发）与健康探针经 geo 空 realm 免认证，远程访问必须先过
+                # AllowedWebCidr 再持凭据，两道门独立。
+                AUTH_LINES=""
+                ADMIN_GEO=""
+                if [ "$ADMIN_AUTH" = "true" ]; then
+                  install -d -m 0700 /opt/corenova/credentials
+                  if [ ! -s /opt/corenova/credentials/admin.txt ]; then
+                    ADMIN_PASS="$(openssl rand -hex 12)"
+                    printf 'corenova:%s\n' "$ADMIN_PASS" > /opt/corenova/credentials/admin.txt
+                  fi
+                  chown root:root /opt/corenova/credentials/admin.txt
+                  chmod 0600 /opt/corenova/credentials/admin.txt
+                  ADMIN_PASS="$(cut -d: -f2 /opt/corenova/credentials/admin.txt)"
+                  printf 'corenova:%s\n' "$(openssl passwd -6 "$ADMIN_PASS")" > /etc/nginx/corenova-admin.htpasswd
+                  chown root:www-data /etc/nginx/corenova-admin.htpasswd
+                  chmod 0640 /etc/nginx/corenova-admin.htpasswd
+                  ADMIN_GEO='geo $corenova_admin_realm { default "CoreNova admin access"; 127.0.0.1 ""; ::1 ""; }'
+                  AUTH_LINES='  auth_basic $corenova_admin_realm;
+                  auth_basic_user_file /etc/nginx/corenova-admin.htpasswd;'
+                fi
+
                 cat > /etc/nginx/snippets/corenova-app.conf <<EOF
                 allow 127.0.0.1;
                 allow ::1;
@@ -595,6 +639,7 @@ Resources:
                 client_max_body_size ${MAX_BODY_MB}m;
                 client_body_timeout 300s;
                 location / {
+                ${AUTH_LINES}
                   proxy_pass http://corenova_${APP_NAME};
                   proxy_http_version 1.1;
                   proxy_set_header Host \$http_host;
@@ -612,6 +657,7 @@ Resources:
 
                 cat > /etc/nginx/conf.d/corenova-proxy.conf <<EOF
                 map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
+                ${ADMIN_GEO}
 
                 upstream corenova_${APP_NAME} {
                   server 127.0.0.1:${CONTAINER_PORT} max_fails=3 fail_timeout=10s;
@@ -745,6 +791,7 @@ Resources:
                 AWS_REGION="${CFNOVA_AWS_REGION:-us-east-1}"
                 ENV_FILE="/opt/corenova/env/${APP_NAME}.env"
                 DOCKER_SOCKET_ACCESS="${CFNOVA_DOCKER_SOCKET_ACCESS:-false}"
+                HOST_METRICS_ACCESS="${CFNOVA_HOST_METRICS_ACCESS:-false}"
                 EXTRA_TCP_PORT="${CFNOVA_EXTRA_TCP_PORT:-0}"
                 EXTRA_UDP_PORT="${CFNOVA_EXTRA_UDP_PORT:-0}"
 
@@ -754,6 +801,14 @@ Resources:
                   true)
                     [ -S /var/run/docker.sock ] || { echo '[corenova] Docker socket 不存在'; exit 1; }
                     EXTRA_ARGS="--mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock"
+                    ;;
+                  false) ;;
+                  *) exit 1 ;;
+                esac
+                case "$HOST_METRICS_ACCESS" in
+                  true)
+                    # 宿主机指标只读挂载（netdata 约定 /host 前缀）；不暴露任何可写宿主路径。
+                    EXTRA_ARGS="$EXTRA_ARGS -v /proc:/host/proc:ro -v /sys:/host/sys:ro -v /etc/localtime:/etc/localtime:ro"
                     ;;
                   false) ;;
                   *) exit 1 ;;

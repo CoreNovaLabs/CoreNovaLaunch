@@ -11,10 +11,13 @@ TLS_PEM_PATH="${CFNOVA_TLS_PEM_PATH:-}"
 SELF_SIGNED_TLS="${CFNOVA_SELF_SIGNED_TLS:-false}"
 ALLOWED_WEB_CIDR="${CFNOVA_ALLOWED_WEB_CIDR:-127.0.0.1/32}"
 MAX_BODY_MB="${CFNOVA_MAX_BODY_MB:-100}"
+ADMIN_AUTH="${CFNOVA_ADMIN_AUTH:-false}"
 
 # 默认仅允许 SSM 转发后的本机访问；不信任客户端提供的转发地址。
 python3 -c 'import ipaddress, sys; ipaddress.IPv4Network(sys.argv[1], strict=False)' "$ALLOWED_WEB_CIDR"
 [[ "$MAX_BODY_MB" =~ ^[1-9][0-9]{0,4}$ ]] && (( MAX_BODY_MB <= 10240 )) || exit 1
+# 仅允许结构化选项，与 DockerSocketAccess 同一防注入纪律。
+case "$ADMIN_AUTH" in true|false) ;; *) exit 1 ;; esac
 
 install -d -m 0755 /etc/nginx/tls /var/log/nginx
 DEBIAN_FRONTEND=noninteractive apt-get install -y nginx logrotate || {
@@ -42,6 +45,29 @@ fi
 
 # HTTP 与 HTTPS 使用同一组代理、上传和访问控制指令，避免两条入口漂移。
 install -d -m 0755 /etc/nginx/snippets
+
+# 管理保护：整站 HTTP Basic。凭据只在首次生成后复用（栈更新不换密码）；
+# 本机（SSM 端口转发）与健康探针经 geo 空 realm 免认证，远程访问必须先过
+# AllowedWebCidr 再持凭据，两道门独立。
+AUTH_LINES=""
+ADMIN_GEO=""
+if [ "$ADMIN_AUTH" = "true" ]; then
+  install -d -m 0700 /opt/corenova/credentials
+  if [ ! -s /opt/corenova/credentials/admin.txt ]; then
+    ADMIN_PASS="$(openssl rand -hex 12)"
+    printf 'corenova:%s\n' "$ADMIN_PASS" > /opt/corenova/credentials/admin.txt
+  fi
+  chown root:root /opt/corenova/credentials/admin.txt
+  chmod 0600 /opt/corenova/credentials/admin.txt
+  ADMIN_PASS="$(cut -d: -f2 /opt/corenova/credentials/admin.txt)"
+  printf 'corenova:%s\n' "$(openssl passwd -6 "$ADMIN_PASS")" > /etc/nginx/corenova-admin.htpasswd
+  chown root:www-data /etc/nginx/corenova-admin.htpasswd
+  chmod 0640 /etc/nginx/corenova-admin.htpasswd
+  ADMIN_GEO='geo $corenova_admin_realm { default "CoreNova admin access"; 127.0.0.1 ""; ::1 ""; }'
+  AUTH_LINES='  auth_basic $corenova_admin_realm;
+  auth_basic_user_file /etc/nginx/corenova-admin.htpasswd;'
+fi
+
 cat > /etc/nginx/snippets/corenova-app.conf <<EOF
 allow 127.0.0.1;
 allow ::1;
@@ -50,6 +76,7 @@ deny all;
 client_max_body_size ${MAX_BODY_MB}m;
 client_body_timeout 300s;
 location / {
+${AUTH_LINES}
   proxy_pass http://corenova_${APP_NAME};
   proxy_http_version 1.1;
   proxy_set_header Host \$http_host;
@@ -67,6 +94,7 @@ EOF
 
 cat > /etc/nginx/conf.d/corenova-proxy.conf <<EOF
 map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
+${ADMIN_GEO}
 
 upstream corenova_${APP_NAME} {
   server 127.0.0.1:${CONTAINER_PORT} max_fails=3 fail_timeout=10s;

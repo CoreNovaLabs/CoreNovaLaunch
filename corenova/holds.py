@@ -11,9 +11,12 @@ deployment.hold（单一事实源）读取，条件写（If-Match）进已发布
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from . import appspec
 from .util import log
@@ -39,6 +42,55 @@ def desired_holds(root: Path) -> dict[str, dict[str, Any]]:
                 "reason": {"en": hold["reason"]["en"], "zh": hold["reason"]["zh"]},
             }
     return out
+
+
+HOLD_COMMENT_MARKER = "# 运维性部署暂停"
+_HOLD_KEY_RE = re.compile(r"^  hold:\s*$", re.MULTILINE)
+
+
+def strip_hold(text: str) -> str:
+    """文本手术解除暂停：切掉 deployment.hold 块 + 其上方紧邻的"运维性部署暂停"注释。
+
+    绝不用 yaml.safe_dump 整文件重写——注释与格式是注册文件的表达层（规则15/21
+    的说明注释都靠它们），dump 会整体重排并永久丢失。结构异常（多处 hold:、归属
+    不是 deployment、手术后 hold 仍在）一律抛错拒绝盲删，交给人工。
+    """
+    matches = list(_HOLD_KEY_RE.finditer(text))
+    if not matches:
+        return text
+    if len(matches) > 1:
+        raise ValueError(f"检测到 {len(matches)} 处顶层 2 缩进 hold:，结构异常，拒绝盲删")
+    lines = text.splitlines(keepends=True)
+    hold_idx = text[: matches[0].start()].count("\n")
+    # 归属校验：hold: 必须挂在顶格 deployment: 下（向上找最近的列 0 key）。
+    owner = ""
+    for i in range(hold_idx - 1, -1, -1):
+        if re.match(r"^[A-Za-z]", lines[i]):
+            owner = lines[i].partition(":")[0].strip()
+            break
+    if owner != "deployment":
+        raise ValueError(f"hold: 归属顶层键 {owner!r} 而非 deployment:，拒绝删除")
+    start = hold_idx
+    while start - 1 >= 0 and lines[start - 1].lstrip().startswith("#"):
+        start -= 1  # 吸收紧邻上方的说明注释（production_contract 与其有 checks: 行隔开，吃不到）
+    end = hold_idx + 1
+    while end < len(lines) and re.match(r"^    ", lines[end]):
+        end += 1  # hold 的子节点（reason/en/zh，缩进 ≥4）
+    result = "".join(lines[:start] + lines[end:])
+    parsed = yaml.safe_load(result) or {}
+    if "hold" in (parsed.get("deployment") or {}):
+        raise ValueError("文本手术后 deployment.hold 仍存在，切除失败")
+    return result
+
+
+def strip_hold_file(path: Path) -> bool:
+    """就地清 hold；返回是否确有改动（供 workflow 判断要不要提交，幂等）。"""
+    text = Path(path).read_text(encoding="utf-8")
+    result = strip_hold(text)
+    if result == text:
+        return False
+    Path(path).write_text(result, encoding="utf-8")
+    return True
 
 
 def sync_holds(

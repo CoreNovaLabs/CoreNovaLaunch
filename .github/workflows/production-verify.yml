@@ -1,0 +1,208 @@
+# production-verify.yml — L1.5 Production Check Gate（verify-gate-design.md §4/§5、deployment-contract.md §2.6）
+#
+# application-verify 成功发布新版本后自动接力：在真实 AWS 为该应用建**一次性**用户栈，
+# 按 apps/<app>.yaml 声明的 checks 逐项实证"生产可部署"。全部通过即满足规则21 的解除
+# 条件——清掉该应用的 deployment.hold 并推回 main，闭合"自动更新 ⇒ 可部署"环。
+#
+# 这是 golden-verify 之外**第二个**允许创建 AWS 资源的工作流，但每个栈都是即用即删。
+name: production-verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "应用名（apps/{app}.yaml 的文件名，必填）"
+        required: true
+        type: string
+      version:
+        description: "app_version（留空 = 核对当前已发布版本）"
+        required: false
+        type: string
+        default: ""
+  repository_dispatch:
+    # application-verify.yml 在发布成功后派发（event_type=production-check）。
+    types: [production-check]
+
+# 同 app 的核对互斥：两个一次性栈并行会抢同名栈/并发清 hold。不打断正在跑的核对。
+concurrency:
+  group: prodcheck-${{ github.event.inputs.app || github.event.client_payload.app }}
+  cancel-in-progress: false
+
+jobs:
+  prodcheck:
+    name: L1.5 production check ${{ github.event.inputs.app || github.event.client_payload.app }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90         # 建栈(≤30min) + 探针 + 删栈收卷
+    permissions:
+      # contents: write 是本工作流的特权终点：只有核对全绿时才提交 apps/<app>.yaml 的
+      # hold 解除并 push main。其余一切情况都不写仓。
+      contents: write
+    env:
+      # 核对对象必须是**已发布**的证据 Manifest，所以后端默认 r2（与 golden 的 dir 相反）。
+      VERIFIED_BACKEND: ${{ secrets.VERIFIED_BACKEND || 'r2' }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_PUBLIC_BASE_URL: ${{ secrets.R2_PUBLIC_BASE_URL }}
+      # 全绿后内联跑 sync_holds.py 清 current.json 的 hold，需要 endpoint（与 sync-holds.yml 对齐）
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+      # 公开 one-click 模板桶：plan() 用它拼 TemplateURL，与官网深链逐字节同源。
+      TEMPLATE_S3_BUCKET: ${{ secrets.TEMPLATE_S3_BUCKET }}
+      GITHUB_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Resolve app / version
+        id: ctx
+        env:
+          INPUT_APP: ${{ github.event.inputs.app }}
+          DISPATCH_APP: ${{ github.event.client_payload.app }}
+          INPUT_VER: ${{ github.event.inputs.version }}
+          DISPATCH_VER: ${{ github.event.client_payload.version }}
+        run: |
+          set -euo pipefail
+          APP="${INPUT_APP:-${DISPATCH_APP}}"
+          VER="${INPUT_VER:-${DISPATCH_VER}}"
+          if [ -z "${APP//[[:space:]]/}" ]; then
+            echo "::error::app 必填（workflow_dispatch 传 app，或 repository_dispatch 的 client_payload.app）。"
+            exit 1
+          fi
+          {
+            echo "APP=${APP}"
+            echo "VERSION=${VER}"
+          } >> "$GITHUB_ENV"
+          echo "app=${APP}" >> "$GITHUB_OUTPUT"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Guard — AWS + 模板桶 + R2 必填
+        env:
+          HAS_AWS: ${{ secrets.AWS_ACCESS_KEY_ID != '' && secrets.AWS_SECRET_ACCESS_KEY != '' && '1' || '' }}
+          HAS_BUCKET: ${{ secrets.TEMPLATE_S3_BUCKET != '' && '1' || '' }}
+          HAS_R2: ${{ secrets.R2_ACCESS_KEY_ID != '' && secrets.R2_BUCKET_NAME != '' && '1' || '' }}
+        run: |
+          set -euo pipefail
+          # 真实核对无 AWS 就是空谈；无模板桶则拿不到与深链同源的 TemplateURL；
+          # 核对对象是**已发布**的 Manifest，缺 R2 凭据连读都读不到。缺一即红。
+          if [ -z "${HAS_AWS}" ] || [ -z "${HAS_BUCKET}" ] || [ -z "${HAS_R2}" ]; then
+            echo "::error::production-verify 需要 AWS 凭据、TEMPLATE_S3_BUCKET 与 R2 凭据（核对必须在真实一次性栈上跑，且对象是已发布证据）。"
+            exit 1
+          fi
+
+      - name: Checkout Repo C
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # 需要完整历史以在 main 上提交 hold 解除
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      # 离线先打印一次性栈计划（零 AWS 调用）：钉扎镜像/AMI、参数、AllowedWebCidr 分支，
+      # 让日志审阅者在真金白银建栈前看清"将测什么、开哪道门"。
+      - name: Dry-run — print production-check plan
+        run: |
+          set -euo pipefail
+          ARGS=(--app "${APP}" --dry-run)
+          [ -n "${VERSION}" ] && ARGS+=(--version "${VERSION}")
+          python scripts/verify/run_production_verify.py "${ARGS[@]}"
+
+      - name: Run production check (real one-off stack)
+        id: check
+        run: |
+          set -uo pipefail
+          ARGS=(--app "${APP}")
+          [ -n "${VERSION}" ] && ARGS+=(--version "${VERSION}")
+          python scripts/verify/run_production_verify.py "${ARGS[@]}" | tee "$RUNNER_TEMP/prodcheck.json"
+          code=${PIPESTATUS[0]}
+          # 全绿只认报告里的 all_passed:true —— 无声明的"跳过"退 0 但不算可解除。
+          if [ "$code" -eq 0 ] && grep -q '"all_passed": true' "$RUNNER_TEMP/prodcheck.json"; then
+            echo "all_passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "all_passed=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
+
+      # 只在全部通过时清 hold：文本手术（holds.strip_hold_file 只删块，保留注释与键序，
+      # 结构异常拒绝盲删），提交回 main。GITHUB_TOKEN 的 push 不会触发 sync-holds.yml，
+      # 故本步内联跑一次同步，把已发布 current.json 的 deploy.hold 也清掉（幂等，
+      # 失败只告警不红——yaml 是真源，重跑 sync-holds.yml 即可补齐）。
+      - name: Clear deployment.hold + publish (only if all green)
+        id: hold
+        if: steps.check.outputs.all_passed == 'true'
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -uo pipefail
+          # 只在 main 上提交：从其它分支 dispatch 时工作区内容与 main 有偏差，
+          # push HEAD:main 会把无关改动带进去——这种情况只给出人工操作指引。
+          if [ "${REF_NAME}" != "main" ]; then
+            echo "::warning::核对全绿，但触发分支是 ${REF_NAME}≠main——不自动提交 hold 解除。"
+            echo "解除方式：在 main 上手动触发本工作流（app=${APP}），或人工删除 apps/${APP}.yaml 的 hold 块后合并。"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # strip_hold_file 就地删块并返回是否改动：0=已删（需提交），3=无 hold（跳过），
+          # 其它=手术抛错（结构异常，拒绝改动）。用退出码传递，免解析 stdout。
+          python -c 'import sys; from pathlib import Path; from corenova import holds; p = Path(sys.argv[1]); sys.exit(0 if (p.exists() and holds.strip_hold_file(p)) else 3)' "apps/${APP}.yaml"
+          rc=$?
+          if [ "$rc" -eq 3 ]; then
+            echo "apps/${APP}.yaml 无 deployment.hold（本就未暂停或已解除）——核对已全绿，无需提交。"
+            echo "hold_cleared=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          elif [ "$rc" -ne 0 ]; then
+            echo "::error::hold 文本手术异常（rc=${rc}）——结构不符预期，拒绝改动 apps/${APP}.yaml。"
+            exit 1
+          fi
+          # 手术后复核：diff 只许触碰这一个文件；production_contract 声明必须仍在
+          # （strip_hold 内部已复核 yaml 可解析且 deployment.hold 已消失）。
+          if [ "$(git diff --name-only)" != "apps/${APP}.yaml" ]; then
+            echo "::error::工作区出现了预期外改动，拒绝提交。"
+            git status --short
+            exit 1
+          fi
+          if ! python -c "import sys, yaml; d = yaml.safe_load(open('apps/${APP}.yaml')); sys.exit(0 if (d.get('deployment') or {}).get('production_contract', {}).get('checks') else 1)"; then
+            echo "::error::手术后 production_contract.checks 丢失——这是核对门禁的输入，拒绝提交。"
+            exit 1
+          fi
+          git add "apps/${APP}.yaml"
+          git commit -m "chore(holds): ${APP} production-verified, unpause"
+          git push origin HEAD:main
+          echo "hold_cleared=true" >> "$GITHUB_OUTPUT"
+          echo "已提交并推送 ${APP} 的 hold 解除。"
+          # 内联同步 R2（若 push 到 main 后 sync-holds 未被触发，这里兜底；失败仅告警）
+          if ! python scripts/verify/sync_holds.py --app "${APP}"; then
+            echo "::warning::current.json 的 hold 内联同步失败——yaml 已更新，请手动重跑 sync-holds.yml。"
+          fi
+
+      - name: Failure note (check not green)
+        if: steps.check.outputs.all_passed != 'true'
+        run: |
+          {
+            echo "## L1.5 生产核对未通过"
+            echo ""
+            echo "- 应用/版本：\`${APP}\` @ \`${VERSION:-（current）}\`"
+            echo "- 退出码：\`${{ steps.check.outputs.exit_code }}\`"
+            echo "- 处理：**deployment.hold 保持不变**，未对 apps/${APP}.yaml 做任何改动。"
+            echo ""
+            echo "查看上方 'Run production check' 日志与 artifact \`prodcheck-${APP}-${{ github.run_id }}\`。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::L1.5 生产核对未全绿（或应用无 production_contract 声明）→ hold 保持不变。"
+          exit 1
+
+      - name: Upload prodcheck evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prodcheck-${{ steps.ctx.outputs.app }}-${{ github.run_id }}
+          path: |
+            data/runs/prodcheck-*.json
+          if-no-files-found: warn
+          retention-days: 90

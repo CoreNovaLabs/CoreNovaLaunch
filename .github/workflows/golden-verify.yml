@@ -9,6 +9,15 @@ on:
   repository_dispatch:
     # Repo B 构建出新 base AMI 后通知（repo-structure.md §2 跨仓触发矩阵）
     types: [ami-built]
+  push:
+    # 平台契约的 cloudformation/cfn_init/network/nginx/docker revision 全部钉在
+    # templates/cloudformation/fixed/**（platformref.compute_revisions）；这些路径一提交，
+    # 契约立即漂移、所有应用验证的 required_platform_contract_valid 变红
+    # （2026-09-18 实证，见 docs/deploy-trials-2026-09.md）。没有这条触发，
+    # 红会一直挂到下一次月度 cron 或人工 dispatch。
+    branches: [main]
+    paths:
+      - "templates/cloudformation/fixed/**"
   workflow_dispatch:
     inputs:
       base_ami_source:
