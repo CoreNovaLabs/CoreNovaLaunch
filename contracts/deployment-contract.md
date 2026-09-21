@@ -170,12 +170,20 @@ Manifest: https://pub-xxxx.r2.dev/screenshots/ghost/v5.75.0/home.png
 两者必须分别建模，禁止互相覆盖：
 
 - **事实源**：`apps/*.yaml` 的 `deployment.hold.reason`（app-schema.md §5 规则21，双语必填）。
-- **发布数据**：`current.json` 的 `deploy.hold`（`{ "reason": { en, zh } }`）；由 Manifest 投影链在
-  验证发布时携带，也可由 `scripts/verify/sync_holds.py` 独立条件写（If-Match）进已发布的
-  `current.json` —— **不等下一次验证**，否则"hold 拦住验证 → hold 字段永远进不了发布数据"死锁。
+- **发布数据**：`deploy.hold` **只存在于 `current.json`**（`{ "reason": { en, zh } }`）——hold 是
+  应用级实时运维态，`current.json` 是唯一实时投影面。发布器写 `versions/<version>.json` 时
+  剥离 hold：不可变版本证据冻结运维态会双向失真（解除后该版本被旧快照永久拦截；hold 之前
+  验证的版本快照缺失、暂停期间反而看起来可部署）。可由 `scripts/verify/sync_holds.py` 独立
+  条件写（If-Match）进已发布的 `current.json` —— **不等下一次验证**，否则"hold 拦住验证 →
+  hold 字段永远进不了发布数据"死锁。
 - **消费规则**：官网任何部署入口（详情页配置器、版本页部署按钮、方案页就绪判定、预渲染 SEO）
   都必须先判定 hold：存在即拦截 `Deploy on AWS` 并展示双语原因，同时把该应用标注为
   "Deployment paused" 而非 "Verified"；拦截逻辑集中在 `deploymentHold()`，禁止各页面自行判断。
+  历史已发布数据里版本记录可能仍带快照 hold，官网构建脚本（`fetch-verified.mjs` →
+  `applyLiveHold`）一律以该应用 `current.json` 的实时值覆写版本记录后再进 payload，
+  前端只消费覆写后的数据。
+- **多版本部署**：暂停是应用级——暂停中全部版本不可部署；解除后凡证据完整（运行时契约字段
+  齐备，见 §2.2/规则消费口径）的历史版本立即可部署，深链按各自 Manifest 的 digest 钉扎。
 - **解除条件**：生产契约重新验证通过（含 AWS 真实部署核对），不是版本更新；解除 = 移除 yaml 里的
   `hold` 后重跑 `sync_holds.py --app <app>` 清除 `deploy.hold`。该重新核对已由 L1.5 生产核对门禁
   （§2.6）自动化：核对全绿即由 `production-verify.yml` 删 hold 并触发 sync-holds。

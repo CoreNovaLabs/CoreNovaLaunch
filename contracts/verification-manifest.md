@@ -227,6 +227,7 @@
 | `config.tests_revision` | `apps/{app}/tests/**` 的 git SHA（未提交回退内容哈希） | 测试变更时变 | 钉住产生本次 `tests_passed` 的测试版本，见 §4.3 |
 | `config.template_revision` / `website.deploy.template.revision` | one-click 模板合并输出的内容 SHA（未提交回退内容哈希） | 模板源变更时变 | 钉住产生本次证据的部署模板版本，对账 `deploy.template`，见 deployment-contract.md §2.4 |
 | `website.deploy.production_contract` | app schema `deployment.production_contract` 投影（`{"checks": [...]}`） | 声明变更时变 | L1.5 生产核对声明，深链据此携带保护参数，hold 据此自动解除，见 deployment-contract.md §2.6；无声明时省略键 |
+| `website.deploy.hold` | app schema `deployment.hold` 投影 | 运维态，**非证据** | 只随 `current.json` 发布；发布器写 `versions/<version>.json` 时剥离（不可变证据不冻结运维态），消费口径见 deployment-contract.md §2.5 |
 | `website.features` / `website.deploy.docker_image` / `website.release.type_evidence` / `website.workflow_run_url` | app schema + 运行时解析 | 投影 | 前端直接消费的字段，必须由生成器从顶层/artifacts 投影，禁止手写第二份 |
 
 ### 4.1 版本 ↔ 镜像绑定证明（强制）

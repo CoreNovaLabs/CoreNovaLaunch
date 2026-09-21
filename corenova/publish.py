@@ -128,6 +128,14 @@ def publish(
     def serialize() -> dict[str, Any]:
         out = _strip_scratch(manifest)
         out["website"] = _strip_scratch(manifest["website"])
+        # deploy.hold 是运维态、只活在 current.json（§2.5）；漏进不可变的版本记录
+        # 会把暂停冻结成历史证据：解除后该版本永远被旧快照拦，反向（hold 前验证的
+        # 版本无快照 hold）则在暂停期间看起来可部署。两个方向都是错的。
+        # 注意重建 deploy 层再 pop——_strip_scratch 只拷顶层，就地 pop 会污染
+        # manifest["website"]，让稍后写 current.json 时 hold 已丢失。
+        dep = out["website"].get("deploy")
+        if isinstance(dep, dict) and "hold" in dep:
+            out["website"]["deploy"] = {k: v for k, v in dep.items() if k != "hold"}
         return out
 
     def placeholder() -> dict[str, Any]:
@@ -220,7 +228,9 @@ def publish(
         result.notes.extend(notes + [f"版本覆盖保护：不更新 current.json —— {why}"])
         result.checks = dict(manifest["checks"])
         return result
-    _put_json(backend, f"verified/{app}/current.json", serialize()["website"])
+    # current.json 是实时运维面：hold 由 Manifest 投影链在此写入（版本记录已剥离，
+    # 之后由 sync_holds.py 单独条件维护）。
+    _put_json(backend, f"verified/{app}/current.json", _strip_scratch(manifest["website"]))
     _update_index(backend, app, manifest)
     _update_versions_index(backend, app, manifest)
     result.current_written = True

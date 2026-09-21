@@ -426,3 +426,25 @@ def test_config_defaults_present(monkeypatch):
     assert cfg.region == "us-east-1" and cfg.architecture == "x86_64"
     assert cfg.base_ami_source == "public"
     assert cfg.ami_ssm_parameter().startswith("/aws/service/")
+
+
+def test_hold_is_live_state_not_baked_into_version_record(tmp_path, shots):
+    """deployment-contract.md §2.5：hold 只活在 current.json。
+
+    冻结进不可变版本证据会双向出错：解除暂停后该版本仍被旧快照拦；
+    hold 之前验证的版本没有快照，暂停期间反而看起来可部署。"""
+    out = tmp_path / "data"
+    backend = DirBackend(out)
+    m = sample_manifest()
+    hold = {"reason": {"en": "Paused pending production check.",
+                       "zh": "暂停待生产核对。"}}
+    m["website"]["deploy"]["hold"] = hold
+    res = publish.publish(backend, Cfg(), m, shots, "<html/>")
+    assert res.committed
+
+    current = json.loads((out / "verified/ghost/current.json").read_text())
+    version = json.loads((out / "verified/ghost/versions/v6.61.0.json").read_text())
+    assert current["deploy"]["hold"] == hold
+    assert "hold" not in version["website"]["deploy"]
+    # 剥离只发生在版本记录副本——就地 pop 会污染内存 manifest
+    assert m["website"]["deploy"]["hold"] == hold
