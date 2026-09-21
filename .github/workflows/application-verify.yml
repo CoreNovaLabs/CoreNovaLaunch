@@ -72,7 +72,8 @@ jobs:
     permissions:
       contents: read
       issues: write        # 失败台账 = GitHub issue（state-machine §7），由 pipeline 写/更新
-      workflows: write     # GITHUB_TOKEN 派发 repository_dispatch/workflow_dispatch 的前置
+      actions: write       # GITHUB_TOKEN 派发 repository_dispatch/workflow_dispatch 的前置
+                           #（注意："workflows" 作用域在 job 级 permissions 非法，会导致编译失败）
     env:
       # 只注入本仓实际读取的变量（repo-structure.md §6）。
       # 这里**不给** REPO_A_PAT：dispatch 由 notify-site 作业负责，避免重复触发前端重建。
