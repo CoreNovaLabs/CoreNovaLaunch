@@ -674,23 +674,18 @@ def _emit_report(cfg: Config, report: ProdCheckReport) -> None:
             fh.write("\n" + summary_markdown(report))
 
 
-# --------------------------------------------------------------------------- manifest 读取 / 编排
+# --------------------------------------------------------------------------- 候选核对编排
 
 
-def load_manifest(backend, app: str, version: str = "") -> dict[str, Any]:
-    """读已发布 Manifest（versions/<ver>.json）——核对的对象必须是发布过的那份证据。
-    不给 version 时取 current.json 指向的版本（发布后立即核对的自然选择）。"""
-    app_key = sanitize_for_id(app)
-    if not version:
-        raw = backend.get(f"verified/{app_key}/current.json")
-        if not raw:
-            raise RuntimeError(f"{app} 尚无已发布的 current.json，无法确定核对版本")
-        version = str(json.loads(raw).get("app_version") or "")
-    key = f"verified/{app_key}/versions/{sanitize_for_id(version)}.json"
-    raw = backend.get(key)
-    if not raw:
-        raise RuntimeError(f"读取发布 Manifest 失败（未发布过该版本？）：{key}")
-    return json.loads(raw)
+def _api_error(exc: Exception) -> str:
+    """Botocore's Code + action name pinpoints the refused call; exception bodies can carry
+    session tokens, so only these two enum-like fields ever reach the evidence."""
+    response = getattr(exc, "response", None)
+    error = response.get("Error") if isinstance(response, dict) else None
+    code = str((error or {}).get("Code") or "")
+    if code:
+        return f"{type(exc).__name__}({getattr(exc, 'operation_name', '') or '?'}={code})"
+    return type(exc).__name__
 
 
 def run(
@@ -753,16 +748,16 @@ def run(
                 )
                 report.checks.extend(asdict(r) for r in run_checks(ctx))
     except Exception as exc:  # noqa: BLE001 - preserve failure evidence and always cleanup
-        # Avoid exception bodies from clients that might include session tokens.
-        report.notes.append(f"production check aborted: {type(exc).__name__}")
-        report.checks.append(asdict(CheckResult("execution", False, type(exc).__name__)))
+        reason = _api_error(exc)
+        report.notes.append(f"production check aborted: {reason}")
+        report.checks.append(asdict(CheckResult("execution", False, reason)))
     finally:
         if attempted and not keep:
             try:
                 report.cleanup_confirmed, notes = destroy_stack(aws, p, instance)
                 report.cleanup += notes
             except Exception as exc:  # noqa: BLE001 - unknown cleanup state must stay red
-                report.cleanup.append(f"cleanup unconfirmed: {type(exc).__name__}")
+                report.cleanup.append(f"cleanup unconfirmed: {_api_error(exc)}")
         elif attempted:
             report.cleanup.append(f"keep-stack: {p.stack_name}; promotion forbidden")
         expected = {"stack_created", "template_match", "public_access_denied", *p.checks}

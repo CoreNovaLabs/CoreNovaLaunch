@@ -453,33 +453,6 @@ def test_assert_projection_rejects_malformed(tmp_path, pc):
         mf.assert_projection(m)
 
 
-# --------------------------------------------------------------------------- load_manifest
-
-
-class FakeBackend:
-    def __init__(self, files: dict[str, str]):
-        self.files = files
-
-    def get(self, key: str) -> bytes | None:
-        raw = self.files.get(key)
-        return raw.encode() if raw is not None else None
-
-
-def test_load_manifest_resolves_current_version():
-    backend = FakeBackend({
-        "verified/ghost/current.json": '{"app_version": "v6.61.0"}',
-        "verified/ghost/versions/v6.61.0.json": '{"app_version": "v6.61.0", "app": "ghost"}',
-    })
-    assert prodcheck.load_manifest(backend, "ghost")["app_version"] == "v6.61.0"
-
-
-def test_load_manifest_errors_when_unpublished():
-    with pytest.raises(RuntimeError, match="current.json"):
-        prodcheck.load_manifest(FakeBackend({}), "ghost")
-    with pytest.raises(RuntimeError, match="未发布过"):
-        prodcheck.load_manifest(FakeBackend({}), "ghost", version="v9.9.9")
-
-
 @pytest.mark.parametrize("url", ["http://public.example/", "https://public.example/",
                                  "http://127.0.0.1:9999/", "http://127.0.0.1:8080.evil/"])
 def test_credentials_never_leave_established_tunnel(url):
@@ -586,6 +559,17 @@ def test_cfn_template_fetch_race_fails_closed():
     p.template_body = "expected public bytes"
     aws = SimpleNamespace(cfn=SimpleNamespace(get_template=lambda **kw: {"TemplateBody": "drifted bytes"}))
     assert not prodcheck.deployed_template_matches(aws, p)
+
+
+def test_abort_record_names_refused_call_without_body():
+    from botocore.exceptions import ClientError
+
+    exc = ClientError({"Error": {"Code": "AccessDenied",
+                                 "Message": "not allowed, token=abc123"}}, "GetTemplate")
+    detail = prodcheck._api_error(exc)
+    assert detail == "ClientError(GetTemplate=AccessDenied)"
+    assert "abc123" not in detail
+    assert prodcheck._api_error(RuntimeError("boom")) == "RuntimeError"
 
 
 def test_volume_delete_must_be_confirmed_and_scoped(fast_poll):
