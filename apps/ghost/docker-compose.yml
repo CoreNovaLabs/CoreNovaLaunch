@@ -17,5 +17,7 @@ services:
       database__connection__filename: /var/lib/ghost/content/data/ghost.db
       database__useNullAsDefault: "true"
       NODE_ENV: production
+      # Disposable verification only: repeat logins must not send device emails.
+      security__staffDeviceVerification: "false"
     volumes:
       - ${CORENOVA_DATA_DIR}:/var/lib/ghost/content

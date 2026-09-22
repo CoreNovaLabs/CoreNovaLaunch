@@ -72,11 +72,13 @@ deployment:
   post_deploy:
     admin_path: "/"
     admin_setup:
-      en: "The first visit walks you through two one-time steps: pick a database (keep the default SQLite unless you have a specific need), then create the admin account. There are no preset credentials."
-      zh: "首次访问有两步一次性设置：先选择数据库（如无特殊需求保持默认 SQLite），然后创建管理员账户；没有预置账号密码。"
+      en: "The first visit walks you through two one-time steps: explicitly select SQLite for the verified embedded-database setup, then create the admin account. There are no preset credentials."
+      zh: "首次访问有两步一次性设置：明确选择 SQLite（已验证的内嵌数据库形态），然后创建管理员账户；没有预置账号密码。"
     notes:
       - en: "Monitoring data is stored on a retained data volume (/app/data). It keeps billing after stack deletion; snapshot it, then delete the volume when no longer needed."
         zh: "监控数据保存在保留数据卷（/app/data）中。删除栈后该卷仍会计费；请先创建快照，不再需要时再删除卷。"
+      - en: "SQLite cold backup (locally restore-tested): stop the writer container, archive ALL of /app/data with numeric ownership (including kuma.db and db-config.json), then restart it. Restore into an empty mount at the same image digest in isolation before starting it; verify owner login, monitors, notification configuration and a real down/up delivery to an isolated receiver. Never restore active production notification destinations into a drill. Configuration exports are not full backups; MariaDB and cloud snapshot recovery were not tested."
+        zh: "SQLite 最小冷备（已本地恢复实测）：停止写入容器，保留数字属主归档整个 /app/data（含 kuma.db 和 db-config.json），再启动原容器。用相同镜像 digest 的隔离容器恢复到空挂载后再启动，核对账户、监控、通知配置并向隔离接收端实测故障与恢复通知。演练不得启用真实生产通知地址。配置导出不是整库备份；MariaDB 与云快照恢复未测。"
   # 月成本估算（app-schema.md §5 规则18）：人工核对的数字，不是前端算的——调价随注册文件版本化。
   # 口径：t3.small 730h ≈ $15.2 + 50GB gp3 ≈ $4 + 公网 IPv4 ≈ $3.65（us-east-1）。
   cost_estimate:

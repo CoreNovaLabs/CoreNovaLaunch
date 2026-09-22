@@ -1,9 +1,4 @@
-"""Uptime Kuma 预写测试的共用夹具。
-
-与 Ghost 同理：容器是每次验证从零启动、跑完销毁的一次性环境。
-Uptime Kuma 的业务 API 面是 socket.io，无稳定可调的 REST 管理端点，
-因此预写测试只覆盖能用 HTTP 稳定断言的部分（见 test_home.py 的未覆盖说明）。
-"""
+"""Disposable Kuma browser and ownership-checked Docker lifecycle fixtures."""
 
 from __future__ import annotations
 
@@ -11,7 +6,9 @@ import os
 
 import pytest
 
-BASE_URL = os.environ.get("CORENOVA_APP_URL", "http://localhost:3001")
+from corenova.business_fixtures import docker_app  # noqa: F401
+
+BASE_URL = os.environ.get("CORENOVA_APP_URL", "http://localhost:3001").rstrip("/")
 
 
 @pytest.fixture(scope="session")

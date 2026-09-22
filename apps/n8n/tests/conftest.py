@@ -10,7 +10,9 @@ import os
 
 import pytest
 
-BASE_URL = os.environ.get("CORENOVA_APP_URL", "http://localhost:5678")
+from corenova.business_fixtures import docker_app  # noqa: F401
+
+BASE_URL = os.environ.get("CORENOVA_APP_URL", "http://localhost:5678").rstrip("/")
 
 
 @pytest.fixture(scope="session")

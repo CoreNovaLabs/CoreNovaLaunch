@@ -80,6 +80,8 @@ deployment:
     notes:
       - en: "Workflows and credentials live on a retained data volume (/home/node/.n8n). It keeps billing after stack deletion; snapshot it, then delete the volume when no longer needed."
         zh: "工作流与凭据保存在保留数据卷（/home/node/.n8n）中。删除栈后该卷仍会计费；请先创建快照，不再需要时再删除卷。"
+      - en: "SQLite cold backup (locally restore-tested): stop the writer container and archive ALL of /home/node/.n8n with numeric ownership, including database.sqlite, config and binary data, then restart it. Restore to an empty mount on an isolated container at the same image digest before starting it; verify owner login, prior execution output and a new execution. Workflow JSON exports are not full backups. Back up any externally supplied encryption key separately; external databases and cloud snapshots were not tested."
+        zh: "SQLite 最小冷备（已本地恢复实测）：停止写入容器，保留数字属主归档整个 /home/node/.n8n（含 database.sqlite、config 和二进制数据），再启动原容器。用相同镜像 digest 的隔离容器恢复到空挂载后再启动，验证 owner 登录、历史执行输出和再次执行。工作流 JSON 导出不是整库备份；外部注入的加密密钥需另行保管。外部数据库与云快照未测。"
   cost_estimate:
     monthly_usd: 23
     note:

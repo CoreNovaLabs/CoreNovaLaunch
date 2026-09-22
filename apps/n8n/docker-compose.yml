@@ -17,5 +17,9 @@ services:
     environment:
       N8N_DIAGNOSTICS_ENABLED: "false"
       N8N_PERSONALIZATION_ENABLED: "false"
+      # This verification compose serves plain HTTP, not production HTTPS.
+      N8N_SECURE_COOKIE: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      N8N_TEMPLATES_ENABLED: "false"
     volumes:
       - ${CORENOVA_DATA_DIR}:/home/node/.n8n

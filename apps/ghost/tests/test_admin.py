@@ -1,9 +1,4 @@
-"""后台链路（断言均为在 ghost:6.61.0-alpine 真容器内实测得到的事实）。
-
-未覆盖：owner 建立与发文写入。Ghost 6 的 setup/session 端点载荷形状与 5.x 文档不一致
-（POST /authentication/setup/ 建号成功后仍返回 500 主题解构错误；密码 grant 返回 404），
-在确认正确调用方式之前，宁可少测，也不写会误判的断言。
-"""
+"""Ghost 6.61.0 real setup/session, publication and cold recovery assertions."""
 
 from __future__ import annotations
 
@@ -27,3 +22,42 @@ def test_admin_spa_is_served(base_url, browser_page):
     resp = page.goto(base_url.rstrip("/") + "/ghost/", wait_until="networkidle")
     assert resp and resp.status == 200, f"后台入口返回 {resp.status if resp else 'None'}"
     assert page.locator("body").inner_text().strip(), "后台页面渲染为空白"
+
+
+def test_owner_publish_restart_and_cold_restore(auth_api, base_url, docker_app, browser_page):
+    import tarfile
+
+    import requests
+    from scenario_setup import owner_session, publish
+
+    post = publish(auth_api, base_url)
+
+    def check_and_edit(url, suffix):
+        session = owner_session(url)  # Fresh login proves account/password persistence.
+        response = session.get(url + "/ghost/api/admin/posts/" + post["id"] + "/", timeout=20)
+        assert response.status_code == 200
+        saved = response.json()["posts"][0]
+        assert saved["slug"] == post["slug"] and saved["status"] == "published"
+        response = session.get(url + "/ghost/api/admin/site/", timeout=20)
+        assert response.status_code == 200
+        assert response.json()["site"]["title"] == "CoreNova Verification"
+        response = requests.get(url + "/" + post["slug"] + "/", timeout=20)
+        assert response.status_code == 200
+        assert "Verified publishing, persistence and recovery: " + post["slug"] in response.text
+        response = session.put(url + "/ghost/api/admin/posts/" + post["id"] + "/",
+                               json={"posts": [{"title": post["title"] + suffix,
+                                                "updated_at": saved["updated_at"]}]}, timeout=20)
+        assert response.status_code == 200, response.text[:500]
+        assert response.json()["posts"][0]["title"] == post["title"] + suffix
+        return session
+
+    browser_page.goto(base_url + "/" + post["slug"] + "/", wait_until="networkidle")
+    browser_page.get_by_role("heading", name=post["title"], exact=True).wait_for()
+    docker_app.restart()
+    check_and_edit(base_url, " — restarted")
+    with docker_app.restored() as replica:
+        with tarfile.open(replica.archive) as archive:
+            assert any(m.name.endswith("data/ghost.db") for m in archive.getmembers())
+        check_and_edit(replica.base_url, " — restored independently")
+    response = requests.get(base_url + "/" + post["slug"] + "/", timeout=20)
+    assert "restarted" in response.text and "restored independently" not in response.text

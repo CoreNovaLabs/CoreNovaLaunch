@@ -42,3 +42,47 @@ def test_editor_shell_served(base_url):
             pass
         time.sleep(5)
     raise AssertionError(f"n8n 编辑器外壳 240s 内未稳定可访问（最后状态 {last_status}）")
+
+
+def test_owner_workflow_execution_restart_and_cold_restore(base_url, docker_app):
+    import hashlib
+    import tarfile
+
+    from scenario_setup import execute, owner_session, read_execution, save_workflow
+
+    from corenova.util import run
+
+    session = owner_session(base_url)
+    workflow, marker = save_workflow(session, base_url)
+    execution_id = execute(session, base_url, workflow, marker)
+
+    def verify_saved_and_run(url):
+        api = owner_session(url)
+        response = api.get(url + "/rest/workflows/" + workflow["id"], timeout=20)
+        assert response.status_code == 200
+        saved = response.json()["data"]
+        assert saved["name"] == workflow["name"]
+        assert saved["settings"]["executionOrder"] == "v1"
+        assert saved["nodes"] == workflow["nodes"]
+        read_execution(api, url, execution_id, marker)
+        new_id = execute(api, url, saved, marker)
+        assert new_id != execution_id
+        return api
+
+    docker_app.restart()
+    verify_saved_and_run(base_url)
+    with docker_app.restored() as replica:
+        with tarfile.open(replica.archive) as archive:
+            members = archive.getmembers()
+            assert any(m.name.endswith("database.sqlite") for m in members)
+            config = next(m for m in members if m.name.rstrip("/").split("/")[-1] == "config")
+            config_hash = hashlib.sha256(archive.extractfile(config).read()).hexdigest()
+        result = run(["docker", "exec", replica.cid, "sha256sum", "/home/node/.n8n/config"])
+        assert result.stdout.split()[0] == config_hash, "Encryption config must survive full-data restore"
+        api = verify_saved_and_run(replica.base_url)
+        response = api.patch(replica.base_url + "/rest/workflows/" + workflow["id"],
+                             json={"name": workflow["name"] + " restored"}, timeout=20)
+        assert response.status_code == 200, response.text[:500]
+        assert response.json()["data"]["name"].endswith(" restored")
+    response = session.get(base_url + "/rest/workflows/" + workflow["id"], timeout=20)
+    assert response.status_code == 200 and response.json()["data"]["name"] == workflow["name"]

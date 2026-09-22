@@ -85,6 +85,8 @@ deployment:
     notes:
       - en: "Content is stored on a retained data volume (/var/lib/ghost/content). It keeps billing after stack deletion; snapshot it, then delete the volume when no longer needed."
         zh: "内容保存在保留数据卷（/var/lib/ghost/content）中。删除栈后该卷仍会计费；请先创建快照，不再需要时再删除卷。"
+      - en: "SQLite cold backup (locally restore-tested): stop the writer container, archive the entire /var/lib/ghost/content directory with numeric ownership, then restart it. Restore into an empty data mount on an isolated container using the same image digest before starting it; verify owner login, published article reads and another edit. Content exports are not full database backups. Cloud snapshot recovery is not covered by this local test."
+        zh: "SQLite 最小冷备（已本地恢复实测）：先停止写入容器，保留数字属主归档整个 /var/lib/ghost/content，再启动原容器。用相同镜像 digest 创建隔离副本，将归档恢复到空数据挂载后再启动，验证 owner 登录、已发布文章读取及再次编辑。内容导出不是整库备份；此本地测试不覆盖云快照恢复。"
   # 月成本估算（app-schema.md §5 规则18）：人工核对的数字，不是前端算的——调价随注册文件版本化。
   # 口径：t3.small 730h ≈ $15.2 + 50GB gp3 ≈ $4 + 公网 IPv4 ≈ $3.65（us-east-1）。
   cost_estimate:
