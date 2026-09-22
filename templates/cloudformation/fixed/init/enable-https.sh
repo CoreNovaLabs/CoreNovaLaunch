@@ -37,7 +37,10 @@ flock -n 9 || fail 'another HTTPS transition is running'
 [ "${CFNOVA_SELF_SIGNED_TLS:-false}" = false ] &&
 [ -z "${CFNOVA_TLS_PEM_PATH:-}" ] &&
 [ "${CFNOVA_GOLDEN_MODE:-false}" = false ] || fail 'requires a private, non-Golden deployment'
-[ "$(cat /run/corenova-cfn-init.rc)" = 0 ] || fail 'bootstrap has not completed'
+# /run is tmpfs and user-data does not re-run on stop/start, so the tmpfs rc alone would lock a
+# private deployment out of HTTPS after any reboot. The root-disk marker says the asset chain
+# finished once; the mount/service/readiness checks below are what actually gate this transition.
+[ -f /opt/corenova/etc/bootstrap-complete ] || fail 'bootstrap has not completed'
 mountpoint -q "${CFNOVA_DATA_DIR:?}" || fail 'data volume is not mounted'
 systemctl is-active --quiet "corenova-${CFNOVA_APP_NAME:?}" || fail 'application is not running'
 CODE="$(curl -sS --connect-timeout 3 --max-time 15 -o /dev/null -w '%{http_code}' "http://127.0.0.1${CFNOVA_HEALTH_PATH:-/}")"

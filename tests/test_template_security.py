@@ -1,14 +1,17 @@
 """Offline execution of shipped assets, with host/network commands replaced by strict fakes."""
 from __future__ import annotations
 
+import builtins
 import io
 import json
 import os
-from pathlib import Path
 import shlex
 import stat
 import subprocess
 import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -174,7 +177,11 @@ esac
         "CFNOVA_ALLOWED_WEB_CIDR": "127.0.0.1/32", "CFNOVA_SELF_SIGNED_TLS": "false",
         "CFNOVA_CONTAINER_PORT": "8080", "CFNOVA_DATA_DIR": str(tmp_path / "data"),
     }.items()) + "\n")
-    (tmp_path / "run/corenova-cfn-init.rc").write_text("0" if initialized else "1")
+    # No /run/corenova-cfn-init.rc here on purpose: /run is tmpfs and user-data does not re-run on
+    # stop/start, so every case below also proves the post-reboot state can still enable HTTPS.
+    (tmp_path / "opt/etc/bootstrap-complete").write_text("completed_at=2026-09-22T00:00:00Z\n")
+    if not initialized:
+        (tmp_path / "opt/etc/bootstrap-complete").unlink()
     (tmp_path / "nginx/conf.d/corenova-proxy.conf").write_text("private-config\n")
     (tmp_path / "nginx/snippets/corenova-app.conf").write_text("private-snippet\n")
     for name in ("cert.pem", "chain.pem", "privkey.pem", "fullchain.pem"):
@@ -261,20 +268,34 @@ def test_renewal_failure_restores_previous_pem(tmp_path):
 
 
 def execute_mount(tmp_path, monkeypatch, *, devices=("xvdf",), fs="ext4", contents=b"", system_disk=False,
-                  signatures=None, children=False, mount_failure=False, mapping="sdf", nvme_mapping="sdf"):
-    """Execute the actual inline Python, replacing only devices, IMDS and OS commands."""
+                  signatures=None, children=False, mount_failure=False, mapping="sdf", nvme_mapping="sdf",
+                  volume=None, ec2_error=False, http_error=0, size=None):
+    """Execute the actual inline Python, replacing only devices, IMDS/EC2 and OS commands."""
     source = (INIT / "01-mount-data.sh").read_text().split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
     dev = tmp_path / "dev"
     dev.mkdir()
     for name in devices:
-        (dev / name).write_bytes(contents)
+        with (dev / name).open("wb") as disk:
+            disk.write(contents)
+            if size:
+                # Sparse: a whole-volume scan would read it, a bounded probe reads head and tail.
+                disk.truncate(size)
+    # EBS publishes the volume id as the block serial: Xen keeps the dash, NVMe drops it.
+    sysfs = tmp_path / "sys/block"
+    for name in devices:
+        serial = sysfs / name / "device"
+        serial.mkdir(parents=True)
+        (serial / "serial").write_text("vol0123456789abcdef0" if name.startswith("nvme")
+                                       else "vol-0123456789abcdef0")
     data_root = tmp_path / "data"
     fstab = tmp_path / "fstab"
     fstab.write_text("# existing root entry\nUUID=root / ext4 defaults 0 1\n")
     source = source.replace("/var/lib/corenova", str(data_root)).replace("'/dev'", repr(str(dev)))
+    source = source.replace("'/sys/block'", repr(str(sysfs)))
     source = source.replace("'/etc/fstab'", repr(str(fstab)))
     mount = data_root / "app/data"
     calls = []
+    reads = []
     uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     current_fs = fs
 
@@ -311,29 +332,107 @@ def execute_mount(tmp_path, monkeypatch, *, devices=("xvdf",), fs="ext4", conten
             raise subprocess.CalledProcessError(rc, args)
         return subprocess.CompletedProcess(args, rc, out, "")
 
+    doc = {
+        "volume_id": "vol-0123456789abcdef0", "instance": "i-this-instance", "app_tag": "demo",
+        "snapshot": "", "status": "in-use", "multi_attach": "false",
+        "create_time": (datetime.now(timezone.utc) - timedelta(minutes=3)).strftime(
+            "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+    } | (volume or {})
+    # Wire shape taken from the EC2 service model: Volume.State is serialized as <status>, and so
+    # is VolumeAttachment.State - a fixture that invents <state> would hide a real parse failure.
+    described = ['''<DescribeVolumesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+      <volumeSet><item>
+        <volumeId>{volume_id}</volumeId><size>30</size><snapshotId>{snapshot}</snapshotId>
+        <status>{status}</status><createTime>{create_time}</createTime>
+        <multiAttachEnabled>{multi_attach}</multiAttachEnabled>
+        <attachmentSet><item><attachmentId>attach-1</attachmentId><device>/dev/sdf</device>
+          <instanceId>{instance}</instanceId><status>attached</status></item></attachmentSet>
+        <tagSet><item><key>corenova:app</key><value>{app_tag}</value></item></tagSet>
+      </item></volumeSet>
+    </DescribeVolumesResponse>'''.format(**doc).encode()]
+    imds = {
+        "block-device-mapping/": b"root\nebs1",
+        "block-device-mapping/root": b"/dev/sda1",
+        "block-device-mapping/ebs1": ("/dev/" + mapping).encode(),
+        "instance-id": b"i-this-instance",
+        "placement/region": b"us-east-1",
+        "services/domain": b"amazonaws.com",
+        "iam/security-credentials/": b"corenova-role",
+        "iam/security-credentials/corenova-role": json.dumps({
+            "AccessKeyId": "AKIAIOSFODNN7EXAMPLE",
+            "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            # IMDSv2 names the session token "Token", not "SessionToken".
+            "Token": "test-session-token"}).encode(),
+    }
+    requests = []
+
     def urlopen(request, **kwargs):
-        if request.full_url.endswith("api/token"):
+        url = getattr(request, "full_url", request)
+        headers = getattr(request, "headers", {})
+        if url.endswith("api/token"):
             assert request.method == "PUT"
             return io.BytesIO(b"test-token")
-        assert request.get_header("X-aws-ec2-metadata-token") == "test-token"
-        return io.BytesIO(b"root\nebs1" if request.full_url.endswith("mapping/") else mapping.encode())
+        if url.startswith("https://ec2."):
+            requests.append(url)
+            assert "AWS4-HMAC-SHA256" in headers.get("Authorization", ""), (
+                "DescribeVolumes must be SigV4-signed with the instance role")
+            if ec2_error:
+                raise urllib.error.URLError("ec2 endpoint unavailable")
+            if http_error:
+                raise urllib.error.HTTPError(url, http_error, "Forbidden", {}, io.BytesIO(
+                    b'<Response><Errors><Error><Code>AccessDenied</Code></Error></Errors></Response>'))
+            assert len(requests) == 1, "DescribeVolumes must be called once per authorization"
+            return io.BytesIO(described[0])
+        assert url.startswith("http://169.254.169.254/latest/meta-data/")
+        assert headers.get("X-aws-ec2-metadata-token") == "test-token"
+        return io.BytesIO(imds[url.removeprefix("http://169.254.169.254/latest/meta-data/")])
 
+    real_open = open
+    device_paths = {str(dev / name) for name in devices}
+
+    class CountingFile:
+        """Proves the blank-disk check stays O(1) in volume size: the device is never read whole."""
+
+        def __init__(self, handle):
+            self._handle = handle
+
+        def read(self, size=-1):
+            data = self._handle.read(size)
+            reads.append(len(data))
+            return data
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self._handle.close()
+
+    def counting_open(*args, **kwargs):
+        handle = real_open(*args, **kwargs)
+        return CountingFile(handle) if args and str(args[0]) in device_paths else handle
+
+    monkeypatch.setenv("CFNOVA_APP_NAME", "demo")
     with monkeypatch.context() as m:
         m.setattr(subprocess, "run", command)
         m.setattr(stat, "S_ISBLK", lambda mode: True)
         m.setattr("urllib.request.urlopen", urlopen)
+        m.setattr("time.sleep", lambda seconds: None)
+        m.setattr(builtins, "open", counting_open)
         m.setattr(sys, "argv", ["mount-data", str(mount)])
         try:
             exec(compile(source, "01-mount-data.sh:python", "exec"), {})
             error = None
         except (SystemExit, subprocess.CalledProcessError) as exc:
             error = exc
-    return calls, fstab.read_text(), error
+    return calls, fstab.read_text(), error, SimpleNamespace(requests=requests, bytes_read=sum(reads))
 
 
 @pytest.mark.parametrize("device", ["sdf", "xvdf", "nvme7n1"])
 def test_mount_identifies_mapping_not_enumeration_order(tmp_path, monkeypatch, device):
-    calls, fstab, error = execute_mount(tmp_path, monkeypatch, devices=(device,))
+    calls, fstab, error, _ = execute_mount(tmp_path, monkeypatch, devices=(device,))
     assert error is None, error
     assert not any(c[0] == "mkfs.ext4" for c in calls)
     assert "UUID=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" in fstab
@@ -344,21 +443,61 @@ def test_mount_identifies_mapping_not_enumeration_order(tmp_path, monkeypatch, d
 @pytest.mark.parametrize("options", [
     {"devices": ()}, {"system_disk": True}, {"devices": ("sdf", "xvdf")},
     {"devices": ("nvme7n1",), "nvme_mapping": "sda1"}, {"mapping": "sda1"},
-    {"fs": "xfs"}, {"fs": "", "contents": b"unrecognized data"},
+    {"fs": "xfs"},
     {"fs": "", "signatures": [{"type": "gpt"}]}, {"children": True}, {"mount_failure": True},
 ])
 def test_mount_failure_never_formats_or_updates_fstab(tmp_path, monkeypatch, options):
-    calls, fstab, error = execute_mount(tmp_path, monkeypatch, **options)
+    calls, fstab, error, _ = execute_mount(tmp_path, monkeypatch, **options)
     assert error is not None
     assert not any(c[0] == "mkfs.ext4" for c in calls)
     assert "UUID=aaaaaaaa" not in fstab
 
 
-def test_only_confirmed_all_zero_new_ebs_is_formatted(tmp_path, monkeypatch):
-    calls, fstab, error = execute_mount(tmp_path, monkeypatch, fs="", contents=b"\0" * 10000)
+def test_new_volume_is_authorized_by_identity_not_by_content(tmp_path, monkeypatch):
+    """On Nitro a brand-new volume's unwritten blocks read back as stable non-zero data
+    (measured 2026-09-22), so content cannot prove newness in either direction; EC2 identity can."""
+    calls, fstab, error, observed = execute_mount(tmp_path, monkeypatch, fs="",
+                                                  contents=b"\0" * 4096 + b"junk" * 64,
+                                                  size=4 * 1024 ** 3)
     assert error is None, error
     assert len([c for c in calls if c[0] == "mkfs.ext4"]) == 1
     assert "UUID=aaaaaaaa" in fstab
+    assert len(observed.requests) == 1
+    # 格式化授权只能来自一次 EC2 身份查询；任何按卷大小缩放的读内容路径都不许出现。
+    assert observed.bytes_read <= 1024 * 1024
+
+
+@pytest.mark.parametrize("volume", [
+    {"snapshot": "snap-0123456789abcdef0"}, {"status": "available"}, {"multi_attach": "true"},
+    {"instance": "i-somebody-elses-volume"}, {"app_tag": "another-app"},
+    {"create_time": (datetime.now(timezone.utc) - timedelta(days=30)).strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z")},
+])
+def test_only_a_volume_this_stack_just_created_may_be_formatted(tmp_path, monkeypatch, volume):
+    calls, fstab, error, _ = execute_mount(tmp_path, monkeypatch, fs="", contents=b"\0" * 4096,
+                                           volume=volume)
+    assert error is not None
+    assert not any(c[0] == "mkfs.ext4" for c in calls)
+    assert "UUID=aaaaaaaa" not in fstab
+
+
+def test_unreachable_ec2_refuses_format_instead_of_trusting_a_blank_read(tmp_path, monkeypatch):
+    calls, fstab, error, _ = execute_mount(tmp_path, monkeypatch, fs="", contents=b"\0" * 4096,
+                                           ec2_error=True)
+    assert error is not None
+    assert not any(c[0] == "mkfs.ext4" for c in calls)
+    assert "UUID=aaaaaaaa" not in fstab
+
+
+def test_http_rejection_is_reported_once_and_blocks_formatting(tmp_path, monkeypatch):
+    """4xx means the request or the grant is wrong; retrying 8x only delays the stack."""
+    calls, fstab, error, observed = execute_mount(tmp_path, monkeypatch, fs="", contents=b"\0" * 4096,
+                                                  http_error=403)
+    assert error is not None
+    assert "AccessDenied" in str(error)
+    assert len(observed.requests) == 1
+    assert not any(c[0] == "mkfs.ext4" for c in calls)
+    assert "UUID=aaaaaaaa" not in fstab
 
 
 def test_userdata_signals_failure_and_exits_before_starting_services(tmp_path):
@@ -385,6 +524,7 @@ INIT_RC=42
 @pytest.mark.parametrize("golden_canary", [False, True])
 def test_real_nginx_public_http_never_authenticates_or_proxies_credentials(tmp_path, golden_canary):
     import uuid
+
     from tests.test_user_template import docker
 
     for image in ("nginx:alpine", "node:22-alpine"):
