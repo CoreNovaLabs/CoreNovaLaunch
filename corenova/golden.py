@@ -783,46 +783,64 @@ def validate_templates(aws: Aws) -> list[str]:
     return notes
 
 
-def _validate_template(aws: Aws, name: str) -> None:
-    """ValidateTemplate 单个模板；超过 TemplateBody API 上限时改走 TemplateURL。
-
-    超限对象临时放到模板桶 golden-validate/ 前缀下（桶策略允许公开 GetObject，
-    CloudFormation 服务才能读到），校验完成/失败都立即删除，不留公开副本。
-    Golden 全局单组（concurrency），固定 key 无并发覆盖风险。
-    """
-    body = template_path(aws.cfg, name).read_text(encoding="utf-8")
-    if len(body.encode("utf-8")) <= TEMPLATE_BODY_API_LIMIT:
-        aws.cfn.validate_template(TemplateBody=body)
-        return
-    bucket = aws.cfg.template_bucket
-    if not bucket:
-        raise RuntimeError(
-            f"{name} 超过 TemplateBody {TEMPLATE_BODY_API_LIMIT} 字节上限，且未配置 "
-            "TEMPLATE_S3_BUCKET（config/verify.yaml template_s3.bucket）→ 无法走 TemplateURL 校验"
-        )
-    from . import template_publish
-
-    key = f"{TEMP_VALIDATE_PREFIX}/{aws.cfg.region}/{name}"
-    region = aws.cfg.template_s3_region
+def _template_s3(aws: Aws) -> Any:
     # boto3 对 us-east-1 默认解析为全局 s3.amazonaws.com；部分网络环境对该域不稳定，
     # 显式 regional endpoint（与模板桶同区）避免环境差异。
     import boto3
 
-    s3 = boto3.client("s3", region_name=region, endpoint_url=f"https://s3.{region}.amazonaws.com")
-    url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
-    try:
-        s3.put_object(
-            Bucket=bucket, Key=key, Body=body.encode("utf-8"),
-            ContentType=template_publish.TEMPLATE_CONTENT_TYPE,
+    region = aws.cfg.template_s3_region
+    return boto3.client("s3", region_name=region, endpoint_url=f"https://s3.{region}.amazonaws.com")
+
+
+def template_argument(aws: Aws, name: str, token: str = "") -> tuple[dict[str, str], str]:
+    """CFN 的模板入参：TemplateBody 有 51200 字节 API 上限，超限模板必须经 TemplateURL 交付。
+
+    返回 (入参, 临时对象 key)。key 非空时对象公开可读，调用方必须在 CloudFormation
+    真正取到模板之后再 cleanup_template（建栈调用返回时 CFN 可能还没拉取）。
+    临时对象放在 golden-validate/ 前缀下：IAM 与桶策略已按该前缀授权公开读，
+    CFN 服务端才读得到（见 docs/deploy-trials-2026-09.md §1 修复③）。
+    """
+    body = template_path(aws.cfg, name).read_text(encoding="utf-8")
+    if len(body.encode("utf-8")) <= TEMPLATE_BODY_API_LIMIT:
+        return {"TemplateBody": body}, ""
+    bucket = aws.cfg.template_bucket
+    if not bucket:
+        raise RuntimeError(
+            f"{name} 超过 TemplateBody {TEMPLATE_BODY_API_LIMIT} 字节上限，且未配置 "
+            "TEMPLATE_S3_BUCKET（config/verify.yaml template_s3.bucket）→ 无法走 TemplateURL"
         )
-        log(f"{name} 超过 TemplateBody 上限 → TemplateURL 校验 s3://{bucket}/{key}")
-        aws.cfn.validate_template(TemplateURL=url)
+    from . import template_publish
+
+    region = aws.cfg.template_s3_region
+    key = f"{TEMP_VALIDATE_PREFIX}/{aws.cfg.region}/{name}" + (f"-{token}" if token else "")
+    url = f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
+    _template_s3(aws).put_object(
+        Bucket=bucket, Key=key, Body=body.encode("utf-8"),
+        ContentType=template_publish.TEMPLATE_CONTENT_TYPE,
+    )
+    log(f"{name} 超过 TemplateBody 上限 → TemplateURL s3://{bucket}/{key}")
+    return {"TemplateURL": url}, key
+
+
+def cleanup_template(aws: Aws, key: str) -> None:
+    """删除临时模板对象；清理失败只记录，不掩盖调用结论（残留需人工清）。"""
+    if not key:
+        return
+    bucket = aws.cfg.template_bucket
+    try:
+        _template_s3(aws).delete_object(Bucket=bucket, Key=key)
+    except Exception as exc:  # noqa: BLE001
+        log(f"临时模板对象删除失败（残留对象公开可读，需手动清理 s3://{bucket}/{key}）："
+            f"{type(exc).__name__}: {exc}")
+
+
+def _validate_template(aws: Aws, name: str) -> None:
+    """ValidateTemplate 单个模板；超过 TemplateBody API 上限时改走 TemplateURL。"""
+    source, key = template_argument(aws, name)
+    try:
+        aws.cfn.validate_template(**source)
     finally:
-        try:
-            s3.delete_object(Bucket=bucket, Key=key)
-        except Exception as exc:  # noqa: BLE001 - 清理失败不得掩盖校验结论
-            log(f"临时校验对象删除失败（不影响门禁；残留对象公开可读，应手动清理 "
-                f"s3://{bucket}/{key}）：{type(exc).__name__}: {exc}")
+        cleanup_template(aws, key)
 
 
 def ensure_network_stack(aws: Aws, stack_name: str) -> str:
@@ -890,20 +908,24 @@ def as_cfn_parameters(params: dict[str, str]) -> list[dict[str, str]]:
 
 def plan_change_set(aws: Aws, stack_name: str, params: dict[str, str], token: str) -> tuple[str, str]:
     """Step 2's second half: plan without executing, so CFN itself judges the template."""
-    body = template_path(aws.cfg, "canary.yaml").read_text(encoding="utf-8")
+    source, key = template_argument(aws, "canary.yaml", f"plan-{token}")
     name = f"corenova-golden-plan-{token}"
-    cfn_type = _change_set_type(aws, stack_name)
-    resp = aws.cfn.create_change_set(
-        StackName=stack_name,
-        TemplateBody=body,
-        Parameters=as_cfn_parameters(params),
-        ChangeSetName=name,
-        ChangeSetType=cfn_type,
-        Capabilities=["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM"],
-        Description="CoreNova Golden Verification plan (no-execute)",
-    )
-    _wait_change_set(aws, name, stack_name)
-    changes = aws.cfn.describe_change_set(StackName=stack_name, ChangeSetName=name).get("Changes", [])
+    try:
+        cfn_type = _change_set_type(aws, stack_name)
+        resp = aws.cfn.create_change_set(
+            StackName=stack_name,
+            Parameters=as_cfn_parameters(params),
+            ChangeSetName=name,
+            ChangeSetType=cfn_type,
+            Capabilities=["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM"],
+            Description="CoreNova Golden Verification plan (no-execute)",
+            **source,
+        )
+        # CFN 在 change-set 变为 AVAILABLE 时才拉取模板，等到那时才可删
+        _wait_change_set(aws, name, stack_name)
+        changes = aws.cfn.describe_change_set(StackName=stack_name, ChangeSetName=name).get("Changes", [])
+    finally:
+        cleanup_template(aws, key)
     summary = ", ".join(f"{c['ResourceChange']['Action']}:{c['ResourceChange']['LogicalResourceId']}" for c in changes)
     return resp["Id"], f"{len(changes)} 项变更 {summary[:600]}"
 
@@ -946,25 +968,24 @@ def _wait_stack_gone(aws: Aws, stack_name: str, *, timeout_minutes: int) -> None
         raise RuntimeError(f"栈 {stack_name} 未在 {timeout_minutes} 分钟内删除完成，请手动检查（残留资源=持续计费）")
 
 
-def deploy_canary(aws: Aws, stack_name: str, params: dict[str, str], *, create: bool) -> None:
-    body = template_path(aws.cfg, "canary.yaml").read_text(encoding="utf-8")
+def deploy_canary(aws: Aws, stack_name: str, params: dict[str, str], *, create: bool, source: dict[str, str]) -> None:
     if create:
         aws.cfn.create_stack(
             StackName=stack_name,
-            TemplateBody=body,
             Parameters=as_cfn_parameters(params),
             Capabilities=["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM"],
             Tags=[
                 {"Key": "corenova:purpose", "Value": "golden-verification"},
                 {"Key": "corenova:billing", "Value": "canary-temporary"},
             ],
+            **source,
         )
     else:
         aws.cfn.update_stack(
             StackName=stack_name,
-            TemplateBody=body,
             Parameters=as_cfn_parameters(params),
             Capabilities=["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM"],
+            **source,
         )
 
 
@@ -1830,6 +1851,7 @@ def run(
     canary = Canary(stack_name=stack_name)
     change_set_id = ""
     deployed = False
+    temp_keys: list[str] = []
     verified = False
     exit_code = 0
     try:
@@ -1852,10 +1874,14 @@ def run(
         log(ensure_network_stack(aws, network_stack_name(cfg)))
         params = canary_parameters(cfg, ami_id, stack_outputs(aws, network_stack_name(cfg)), report.platform_verification_id)
         create = _change_set_type(aws, stack_name) == "CREATE"
-        change_set_id, summary = plan_change_set(aws, stack_name, params, time.strftime("%H%M%S", time.gmtime()))
+        token = time.strftime("%H%M%S", time.gmtime())
+        change_set_id, summary = plan_change_set(aws, stack_name, params, token)
         report.change_set = change_set_id
         log(f"change-set({summary[:200]})")
-        deploy_canary(aws, stack_name, params, create=create)
+        # CFN 建栈后异步拉取 TemplateURL，故对象留到 finally（栈已进入终态）再删
+        source, deploy_key = template_argument(aws, "canary.yaml", f"deploy-{token}")
+        temp_keys.append(deploy_key)
+        deploy_canary(aws, stack_name, params, create=create, source=source)
         deployed = True
         # 只等 Instance 就绪，不等整栈 CREATE_COMPLETE：WaitCondition 的 ack 在本环境不稳定
         # （信号 HTTP 200 但资源不翻转，见 README 已知问题），探针才是平台验证的实质依据。
@@ -1959,6 +1985,9 @@ def run(
             if not gone:
                 report.failures.append("canary 清理未确认 —— 残留资源会持续计费，必须人工处理")
                 exit_code = exit_code or 4
+        # 栈已到终态，CFN 不再需要临时模板对象（公开可读，越早删越好）
+        for key in temp_keys:
+            cleanup_template(aws, key)
         report.finished_at = utcnow()
         _write_audit(cfg, report)
 
