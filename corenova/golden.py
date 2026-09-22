@@ -53,6 +53,10 @@ ASSET_SOURCES = (
     "20-cloudwatch-agent.sh",
     "30-app-container.sh",
     "40-ready-and-signal.sh",
+    "01-mount-data.sh",
+    "05-access-policy.sh",
+    "enable-https.sh",
+    "renew-https.sh",
 )
 # contracts/platform-contract.md §2 `verification` - exactly these eleven keys, in contract order.
 VERIFICATION_KEYS = (
@@ -105,6 +109,7 @@ CANARY_PRESETS: dict[str, str] = {
     "CloudWatchLogGroupName": "/corenova/canary",
     "SelfSignedTls": "true",
     "AllowedWebCidr": "0.0.0.0/0",
+    "AdminAuthEnabled": "false",
     "TerminationProtection": "Disabled",
 }
 CANARY_DESCRIPTION = (
@@ -274,11 +279,18 @@ def sync_init_assets(cfg: Config) -> list[str]:
         start, stop = text.find(begin), text.find(end)
         if start < 0 or stop < 0 or stop < start:
             raise RuntimeError(f"app.yaml 缺少 {asset} 的 SYNCED ASSET 标记，无法同步")
-        # 缩进跟随标记行本身，不写死列数
+        # Keep the shebang first: sudo/execve must not fall back to /bin/sh.
         line_start = text.rfind("\n", 0, start) + 1
         pad = text[line_start:start][: len(text[line_start:start]) - len(text[line_start:start].lstrip())]
-        indented = "\n".join((pad + line).rstrip() for line in body.splitlines())
-        text = text[:start] + begin + "\n" + indented + "\n" + pad + text[stop:]
+        lines = body.splitlines()
+        if not lines or lines[0] != "#!/bin/bash":
+            raise RuntimeError(f"{asset} 必须以 Bash shebang 开头")
+        shebang = pad + lines[0] + "\n"
+        if text[:line_start].endswith(shebang):
+            line_start -= len(shebang)
+        block = [lines[0], begin, *lines[1:], end]
+        indented = "\n".join((pad + line).rstrip() for line in block)
+        text = text[:line_start] + indented + text[stop + len(end):]
         changed.append(asset)
     app.write_text(text, encoding="utf-8")
     render_canary(cfg)
@@ -1048,13 +1060,28 @@ def _wait_stack(aws: Aws, stack_name: str, *, timeout_minutes: int) -> str:
 
 def _stack_reason(aws: Aws, stack_name: str) -> str:
     try:
-        events = aws.cfn.describe_stack_events(StackName=stack_name)["StackEvents"][:6]
+        events = aws.cfn.describe_stack_events(StackName=stack_name)["StackEvents"]
     except Exception as exc:  # noqa: BLE001
         return f"(读取栈事件失败 {exc})"
-    return " | ".join(
-        f"{e.get('LogicalResourceId')}:{e.get('ResourceStatus')}:{(e.get('ResourceStatusReason') or '')[:160]}"
-        for e in events
-    )
+
+    def fmt(e: dict) -> str:
+        return (
+            f"{e.get('LogicalResourceId')}:{e.get('ResourceStatus')}"
+            f":{(e.get('ResourceStatusReason') or '')[:300]}"
+        )
+
+    # 回滚已开始后最新事件全是 DELETE_*，真正的失败原因是页内最早一条 CREATE_FAILED
+    # ——不先捞它，证据里只剩"资源正在被删"这种废话（5 个生产核对栈就是这么丢因的）。
+    failed = [e for e in events if e.get("ResourceStatus") in ("CREATE_FAILED", "UPDATE_FAILED")]
+    parts: list[str] = []
+    seen: set[tuple] = set()
+    for e in ([failed[0]] if failed else []) + events[:4]:
+        key = (e.get("LogicalResourceId"), e.get("ResourceStatus"))
+        if key in seen:
+            continue
+        seen.add(key)
+        parts.append(fmt(e))
+    return " | ".join(parts)
 
 
 def _wait_change_set(aws: Aws, name: str, stack_name: str, *, timeout_minutes: int = 5) -> None:

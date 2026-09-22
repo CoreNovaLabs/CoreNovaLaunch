@@ -2,7 +2,9 @@
 # cfn-init asset: renders the nginx reverse proxy that fronts every CoreNova app container.
 # Filename keeps the substring "nginx" so platformref.compute_revisions() can key
 # nginx_base_revision off it (Platform Contract §2.1 public-mode mapping).
-set -xeuo pipefail
+set +x
+set -euo pipefail
+. /opt/corenova/bin/05-access-policy.sh
 
 APP_NAME="${CFNOVA_APP_NAME:?}"
 CONTAINER_PORT="${CFNOVA_CONTAINER_PORT:?}"
@@ -27,11 +29,6 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y nginx logrotate || {
 # 与我们这份 conf 并存会让 nginx -t 直接失败（实测 duplicate default server）。
 rm -f /etc/nginx/sites-enabled/default
 
-if [ -n "$TLS_PEM_PATH" ] && [ ! -s "$TLS_PEM_PATH" ]; then
-  echo "[corenova] WARN: TlsPemPath=$TLS_PEM_PATH is missing or empty, 443 stays closed"
-  TLS_PEM_PATH=""
-fi
-
 if [ -z "$TLS_PEM_PATH" ] && [ "$SELF_SIGNED_TLS" = "true" ]; then
   # Golden Verification must measure a real 443 listener; a self-signed bundle is enough because
   # the probe asserts reachability through the SG, not certificate trust.
@@ -52,20 +49,34 @@ install -d -m 0755 /etc/nginx/snippets
 AUTH_LINES=""
 ADMIN_GEO=""
 if [ "$ADMIN_AUTH" = "true" ]; then
+  umask 077
   install -d -m 0700 /opt/corenova/credentials
   if [ ! -s /opt/corenova/credentials/admin.txt ]; then
-    ADMIN_PASS="$(openssl rand -hex 12)"
+    ADMIN_PASS="$(openssl rand -hex 24)"
     printf 'corenova:%s\n' "$ADMIN_PASS" > /opt/corenova/credentials/admin.txt
   fi
   chown root:root /opt/corenova/credentials/admin.txt
   chmod 0600 /opt/corenova/credentials/admin.txt
-  ADMIN_PASS="$(cut -d: -f2 /opt/corenova/credentials/admin.txt)"
-  printf 'corenova:%s\n' "$(openssl passwd -6 "$ADMIN_PASS")" > /etc/nginx/corenova-admin.htpasswd
+  ADMIN_PASS="$(cut -d: -f2- /opt/corenova/credentials/admin.txt)"
+  printf 'corenova:%s\n' "$(printf '%s\n' "$ADMIN_PASS" | openssl passwd -6 -stdin)" > /etc/nginx/corenova-admin.htpasswd
+  unset ADMIN_PASS
   chown root:www-data /etc/nginx/corenova-admin.htpasswd
   chmod 0640 /etc/nginx/corenova-admin.htpasswd
-  ADMIN_GEO='geo $corenova_admin_realm { default "CoreNova admin access"; 127.0.0.1 ""; ::1 ""; }'
+  umask 022
+  ADMIN_GEO='geo $corenova_admin_realm { default "CoreNova admin access"; 127.0.0.1 off; ::1 off; }'
   AUTH_LINES='  auth_basic $corenova_admin_realm;
   auth_basic_user_file /etc/nginx/corenova-admin.htpasswd;'
+fi
+
+# The HTTP server rejects remote requests before auth or proxy execution.
+HTTP_GUARD='if ($corenova_remote) { return 403; }'
+if [ "$GOLDEN_HTTP" = true ]; then
+  HTTP_GUARD=''
+elif [ -n "$TLS_PEM_PATH" ]; then
+  HTTPS_ORIGIN="$(python3 -c 'import sys; from urllib.parse import urlsplit; p=urlsplit(sys.argv[1]); print("https://"+p.netloc if p.scheme=="https" else "")' "$CFNOVA_APP_URL")"
+  if [ -n "$HTTPS_ORIGIN" ]; then
+    HTTP_GUARD="if (\$corenova_remote) { return 308 ${HTTPS_ORIGIN}\$request_uri; }"
+  fi
 fi
 
 cat > /etc/nginx/snippets/corenova-app.conf <<EOF
@@ -83,6 +94,7 @@ ${AUTH_LINES}
   proxy_set_header X-Real-IP \$remote_addr;
   proxy_set_header X-Forwarded-For \$remote_addr;
   proxy_set_header X-Forwarded-Proto \$scheme;
+  proxy_set_header Authorization \$corenova_authorization;
   proxy_set_header Upgrade \$http_upgrade;
   proxy_set_header Connection \$connection_upgrade;
   proxy_read_timeout 3600s;
@@ -94,6 +106,8 @@ EOF
 
 cat > /etc/nginx/conf.d/corenova-proxy.conf <<EOF
 map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
+geo \$corenova_remote { default 1; 127.0.0.1 0; ::1 0; }
+map "\$scheme:\$corenova_remote" \$corenova_authorization { default \$http_authorization; "http:1" ""; }
 ${ADMIN_GEO}
 
 upstream corenova_${APP_NAME} {
@@ -105,6 +119,7 @@ server {
   listen 80 default_server;
   listen [::]:80 default_server;
   server_name _ ${SERVER_NAMES};
+  ${HTTP_GUARD}
   access_log /var/log/nginx/corenova-${APP_NAME}.access.log;
   include /etc/nginx/snippets/corenova-app.conf;
 }

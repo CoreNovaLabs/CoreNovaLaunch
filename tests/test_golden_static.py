@@ -83,7 +83,8 @@ def test_app_runtime_receives_resolved_url_without_image_curl_dependency():
     app_asset = golden.inlined_assets(SimpleNamespace(root=FIXTURES.parents[2]), "app.yaml")[
         "30-app-container.sh"
     ]
-    assert "latest/meta-data/public-hostname" in app_asset
+    assert "latest/meta-data/public-hostname" not in app_asset
+    assert ". /opt/corenova/bin/05-access-policy.sh" in app_asset
     assert "APP_URL_ENV_NAME" in app_asset
     assert "--health-cmd" not in app_asset
 

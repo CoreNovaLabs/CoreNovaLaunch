@@ -86,9 +86,9 @@ Parameters:
     Default: ""
     AllowedPattern: '^$|^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~%/+?=&-]*)?$'
     Description: >
-      Public URL of this deployment, supplied by the user at deploy time (the stack outputs
-      ResolvedLaunchUrl when left empty). Injected into the container as CORENOVA_APP_URL so the
-      app builds correct absolute links. Empty means "reachable through the instance public DNS name".
+      Application URL, injected as CORENOVA_APP_URL and the app-native URL variable.
+      Empty defaults to http://localhost:8080 through SSM. Non-loopback HTTP is rejected
+      outside the explicit Golden canary. Initialize privately before running enable-https.sh.
 
   Hostnames:
     Type: CommaDelimitedList
@@ -177,7 +177,7 @@ Parameters:
       默认关闭；启用前必须限制管理入口并完成认证，不属于默认验证范围。
   AdminAuthEnabled:
     Type: String
-    Default: "false"
+    Default: "true"
     AllowedValues: ["true", "false"]
     Description: >
       为整个 Web 入口启用 HTTP Basic 管理保护。用户 corenova，随机密码写入
@@ -449,6 +449,7 @@ Resources:
               python3-pip: []
               python3-yaml: []
               sysstat: []
+              nvme-cli: []
               # amazon-ssm-agent 不在 Ubuntu 仓库里（实测 APT 直接报 "does not have ... available"）；
               # Canonical 的 AWS 镜像已预装并注册 SSM agent，探针实测可用，无需安装
           groups:
@@ -471,6 +472,7 @@ Resources:
                 Fn::Sub:
                   - |
                     export CFNOVA_APP_NAME="${AppName}"
+                    export CFNOVA_GOLDEN_MODE="${GoldenMode}"
                     export CFNOVA_IMAGE_REFERENCE="${ImageReference}"
                     export CFNOVA_CONTAINER_PORT="${ContainerPort}"
                     export CFNOVA_DATA_DIR="${DataDirHostPath}"
@@ -496,7 +498,8 @@ Resources:
                     export CFNOVA_READY_DEADLINE="${SignalTimeoutSeconds}"
                     export CFNOVA_EXTRA_ENV_FILE="/opt/corenova/etc/extra.env"
                   - ServerNames: {Fn::Join: [" ", {Ref: Hostnames}]}
-              mode: "000644"
+                    GoldenMode: {Fn::If: [GoldenRunGiven, "true", "false"]}
+              mode: "000600"
               owner: root
               group: root
             /opt/corenova/etc/extra.env:
@@ -509,10 +512,337 @@ Resources:
               mode: "000640"
               owner: root
               group: corenova-app
+            /opt/corenova/bin/01-mount-data.sh:
+              content: |
+                #!/bin/bash
+                # BEGIN SYNCED ASSET 01-mount-data.sh
+                # Identify the requested EBS mapping before any filesystem operation; never guess disk order.
+                set +x
+                set -euo pipefail
+                python3 - "${CFNOVA_DATA_DIR:?}" <<'PY'
+                import json, os, pathlib, re, stat, subprocess, sys, urllib.request
+
+
+                def run(*args, **kwargs):
+                    return subprocess.run(args, check=True, capture_output=True, text=True, **kwargs).stdout.strip()
+
+
+                def fail(message):
+                    sys.exit('[corenova] data volume: ' + message)
+
+
+                mount = pathlib.Path(sys.argv[1])
+                if (not re.fullmatch(r'/var/lib/corenova/[A-Za-z0-9_./-]+', str(mount))
+                        or '..' in mount.parts or mount.resolve() != mount or mount == pathlib.Path('/var/lib/corenova')):
+                    fail('unsafe mount path')
+                base = 'http://169.254.169.254/latest/'
+                token = urllib.request.urlopen(urllib.request.Request(base + 'api/token', method='PUT', headers={
+                    'X-aws-ec2-metadata-token-ttl-seconds': '60'}), timeout=5).read().decode()
+
+
+                def metadata(path):
+                    return urllib.request.urlopen(urllib.request.Request(base + 'meta-data/' + path, headers={
+                        'X-aws-ec2-metadata-token': token}), timeout=5).read().decode().strip()
+
+
+                names = metadata('block-device-mapping/').splitlines()
+                mappings = {metadata('block-device-mapping/' + key).removeprefix('/dev/') for key in names}
+                if not mappings.intersection({'sdf', 'xvdf'}):
+                    fail('IMDS has no requested sdf/xvdf mapping')
+                run('udevadm', 'settle', '--timeout=60')
+                candidates = set()
+                for name in ('sdf', 'xvdf'):
+                    path = pathlib.Path('/dev') / name
+                    if path.exists() and stat.S_ISBLK(path.stat().st_mode):
+                        candidates.add(str(path.resolve()))
+                for path in pathlib.Path('/dev').glob('nvme*n1'):
+                    raw = subprocess.run(['nvme', 'id-ctrl', '--raw-binary', str(path)], check=True, capture_output=True).stdout
+                    model = raw[24:64].decode('ascii', errors='replace').strip(' \x00')
+                    serial = raw[4:24].decode('ascii', errors='replace').strip(' \x00')
+                    mapping = raw[3072:3104].decode('ascii', errors='replace').strip(' \x00').removeprefix('/dev/')
+                    if model == 'Amazon Elastic Block Store' and re.fullmatch(r'vol-?[0-9a-f]+', serial) and mapping in ('sdf', 'xvdf'):
+                        candidates.add(str(path.resolve()))
+                if len(candidates) != 1:
+                    fail('missing or ambiguous EBS mapping')
+                device = candidates.pop()
+                root = run('findmnt', '-nro', 'SOURCE', '/').split('[')[0]
+                root_disks = run('lsblk', '-snrpo', 'NAME', root).splitlines()
+                if device in [os.path.realpath(x) for x in root_disks]:
+                    fail('refusing system disk')
+                info = json.loads(run('lsblk', '--json', '--output', 'NAME,TYPE,MOUNTPOINTS', device))['blockdevices']
+                if len(info) != 1 or info[0]['type'] != 'disk' or info[0].get('children'):
+                    fail('not an unpartitioned data disk')
+                mounted = [x for x in info[0].get('mountpoints', []) if x]
+                if mounted and mounted != [str(mount)]:
+                    fail('device already mounted elsewhere')
+                probe = subprocess.run(['blkid', '-p', '-o', 'value', '-s', 'TYPE', device], capture_output=True, text=True)
+                if probe.returncode not in (0, 2):
+                    fail('ambiguous or unreadable filesystem')
+                fs = probe.stdout.strip()
+                signatures = json.loads(run('wipefs', '--json', '--no-act', device)).get('signatures', [])
+                if fs == 'ext4':
+                    if any(x.get('type') != 'ext4' for x in signatures):
+                        fail('unexpected signature alongside ext4')
+                elif not fs and probe.returncode == 2 and not signatures and not mounted:
+                    # A signature-free disk may still contain unknown data. Only an all-zero EBS disk is new.
+                    with open(device, 'rb', buffering=0) as disk:
+                        while chunk := disk.read(8 * 1024 * 1024):
+                            if chunk.count(0) != len(chunk):
+                                fail('unrecognized non-empty disk; refusing format')
+                    run('mkfs.ext4', '-m', '0', '-L', 'corenova-data', device)
+                else:
+                    fail('unknown filesystem; refusing format')
+                uuid = run('blkid', '-s', 'UUID', '-o', 'value', device)
+                if not re.fullmatch(r'[0-9a-fA-F-]{36}', uuid):
+                    fail('invalid filesystem UUID')
+                mount.mkdir(parents=True, exist_ok=True)
+                fstab = pathlib.Path('/etc/fstab')
+                lines = fstab.read_text().splitlines()
+                kept = []
+                for line in lines:
+                    fields = line.split()
+                    if fields and not line.lstrip().startswith('#') and len(fields) > 1 and fields[1] == str(mount):
+                        if fields[0] != 'UUID=' + uuid:
+                            fail('conflicting fstab mount')
+                    else:
+                        kept.append(line)
+                if not mounted:
+                    run('mount', '-t', 'ext4', '-o', 'noatime', 'UUID=' + uuid, str(mount))
+                run('mountpoint', '-q', str(mount))
+                if run('findmnt', '-nro', 'UUID', '--target', str(mount)) != uuid:
+                    fail('mounted filesystem identity mismatch')
+                kept.append(f'UUID={uuid} {mount} ext4 defaults,noatime 0 2')
+                tmp = fstab.with_name('fstab.corenova.tmp')
+                with open(tmp, 'w') as stream:
+                    stream.write('\n'.join(kept) + '\n')
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.chmod(tmp, 0o644)
+                os.replace(tmp, fstab)
+                print('[corenova] confirmed data volume mounted at ' + str(mount))
+                PY
+                # END SYNCED ASSET 01-mount-data.sh
+              mode: "000755"
+              owner: root
+              group: root
+            /opt/corenova/bin/05-access-policy.sh:
+              content: |
+                #!/bin/bash
+                # BEGIN SYNCED ASSET 05-access-policy.sh
+                # Shared by both renderers; persisted HTTPS state wins over initial CFN parameters.
+                set +x
+                set -euo pipefail
+                if [ -f /opt/corenova/etc/https.env ]; then
+                  . /opt/corenova/etc/https.env
+                fi
+                GOLDEN_HTTP=false
+                if [ "${CFNOVA_GOLDEN_MODE:-false}" = true ]; then
+                  if [ "${CFNOVA_APP_NAME:-}" != corenova-canary ] ||
+                     [ "${CFNOVA_SELF_SIGNED_TLS:-false}" != true ] ||
+                     [ "${CFNOVA_ADMIN_AUTH:-true}" != false ]; then
+                    echo '[corenova] invalid Golden identity/security combination' >&2
+                    exit 1
+                  fi
+                  GOLDEN_HTTP=true
+                fi
+                if [ "${CFNOVA_SELF_SIGNED_TLS:-false}" = true ] && [ "$GOLDEN_HTTP" != true ]; then
+                  echo '[corenova] self-signed TLS is restricted to the explicit Golden canary' >&2
+                  exit 1
+                fi
+                if [ -n "${CFNOVA_TLS_PEM_PATH:-}" ] && [ ! -s "$CFNOVA_TLS_PEM_PATH" ]; then
+                  echo '[corenova] configured TLS PEM is missing; refusing HTTP fallback' >&2
+                  exit 1
+                fi
+                CFNOVA_APP_URL="${CFNOVA_APP_URL:-http://localhost:8080}"
+                python3 - "$CFNOVA_APP_URL" "$GOLDEN_HTTP" <<'PY'
+                import re, sys
+                from urllib.parse import urlsplit
+                url, golden = sys.argv[1:]
+                p = urlsplit(url)
+                if (not re.fullmatch(r'https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~%/+?=&-]*)?', url)
+                        or not p.hostname or p.username or p.password or (p.port is not None and not 1 <= p.port <= 65535)):
+                    sys.exit('invalid LaunchUrl')
+                if p.scheme == 'http' and p.hostname not in ('localhost', '127.0.0.1') and golden != 'true':
+                    sys.exit('public HTTP LaunchUrl is forbidden; initialize through SSM, then enable HTTPS')
+                PY
+                export CFNOVA_APP_URL
+                # END SYNCED ASSET 05-access-policy.sh
+              mode: "000755"
+              owner: root
+              group: root
+            /opt/corenova/bin/enable-https.sh:
+              content: |
+                #!/bin/bash
+                # BEGIN SYNCED ASSET enable-https.sh
+                # Run only after completing the application's own setup through the private SSM tunnel.
+                set +x
+                set -euo pipefail
+                fail() { echo "[corenova] $*" >&2; exit 1; }
+                [ "$#" -eq 3 ] && [ "${3:-}" = --confirm-initialized ] || fail 'usage: enable-https.sh <hostname> <acme-email> --confirm-initialized'
+                [ "$EUID" -eq 0 ] || fail 'root is required'
+                HOST="$1"
+                EMAIL="$2"
+                python3 - "$HOST" "$EMAIL" <<'PY'
+                import ipaddress, re, sys
+                host, email = sys.argv[1:]
+                def domain(value):
+                    return (len(value) <= 253 and '.' in value and all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', x)
+                            for x in value.split('.')) and not value.endswith(('.localhost', '.local', '.invalid', '.test')))
+                try:
+                    ipaddress.ip_address(host)
+                except ValueError:
+                    pass
+                else:
+                    sys.exit('hostname must be a public DNS name, not an IP address')
+                if not domain(host) or not host.rsplit('.', 1)[1].isalpha():
+                    sys.exit('invalid public hostname')
+                local = email.split('@')[0]
+                if (len(email) > 254 or len(local) > 64 or email.count('@') != 1
+                        or not re.fullmatch(r'[A-Za-z0-9_+-]+(?:\.[A-Za-z0-9_+-]+)*', local)
+                        or not domain(email.split('@')[-1])):
+                    sys.exit('invalid ACME email')
+                PY
+                umask 077
+                exec 9>/run/corenova-enable-https.lock
+                flock -n 9 || fail 'another HTTPS transition is running'
+                [ ! -e /opt/corenova/etc/https.env ] || fail 'HTTPS already configured; use certbot renew'
+                . /opt/corenova/etc/init.env
+                [ "${CFNOVA_APP_URL:-http://localhost:8080}" = http://localhost:8080 ] || fail 'initialize using LaunchUrl=http://localhost:8080 first'
+                [ "${CFNOVA_ALLOWED_WEB_CIDR:-}" = 127.0.0.1/32 ] &&
+                [ "${CFNOVA_SELF_SIGNED_TLS:-false}" = false ] &&
+                [ -z "${CFNOVA_TLS_PEM_PATH:-}" ] &&
+                [ "${CFNOVA_GOLDEN_MODE:-false}" = false ] || fail 'requires a private, non-Golden deployment'
+                [ "$(cat /run/corenova-cfn-init.rc)" = 0 ] || fail 'bootstrap has not completed'
+                mountpoint -q "${CFNOVA_DATA_DIR:?}" || fail 'data volume is not mounted'
+                systemctl is-active --quiet "corenova-${CFNOVA_APP_NAME:?}" || fail 'application is not running'
+                CODE="$(curl -sS --connect-timeout 3 --max-time 15 -o /dev/null -w '%{http_code}' "http://127.0.0.1${CFNOVA_HEALTH_PATH:-/}")"
+                case "$CODE" in 2??|3??) ;; *) fail 'private application readiness check failed' ;; esac
+                # No app-independent probe can prove that its administrator was created: the flag attests to that step.
+                TOKEN="$(curl -fsS --connect-timeout 3 --max-time 10 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)"
+                PUBLIC_IP="$(curl -fsS --connect-timeout 3 --max-time 10 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)"
+                python3 - "$HOST" "$PUBLIC_IP" <<'PY'
+                import ipaddress, signal, socket, sys
+                signal.alarm(15)
+                host, expected = sys.argv[1:]
+                if not ipaddress.ip_address(expected).is_global:
+                    sys.exit('instance has no public IPv4 address')
+                addresses = {entry[4][0] for entry in socket.getaddrinfo(host, 80, type=socket.SOCK_STREAM)}
+                # This flow configures the instance's public IPv4 only; reject AAAA and multi-target records too.
+                if addresses != {expected}:
+                    sys.exit('all DNS addresses must point directly to this instance public IPv4 (remove AAAA/proxy records)')
+                PY
+                BACKUP="$(mktemp -d /opt/corenova/etc/.https-backup.XXXXXX)"
+                cp -p /etc/nginx/conf.d/corenova-proxy.conf "$BACKUP/proxy.conf"
+                cp -p /etc/nginx/snippets/corenova-app.conf "$BACKUP/app.conf"
+                COMMITTED=false
+                rollback() {
+                  rc=$?
+                  trap - EXIT HUP INT TERM
+                  set +e
+                  if [ "$COMMITTED" != true ]; then
+                    rm -f /opt/corenova/etc/https.env
+                    rm -f /etc/letsencrypt/renewal-hooks/{pre,post}/corenova-nginx /etc/letsencrypt/renewal-hooks/deploy/corenova-https
+                    if cp -p "$BACKUP/proxy.conf" /etc/nginx/conf.d/corenova-proxy.conf &&
+                       cp -p "$BACKUP/app.conf" /etc/nginx/snippets/corenova-app.conf; then
+                      . /opt/corenova/etc/init.env
+                      export CFNOVA_APP_URL=http://localhost:8080
+                      /opt/corenova/bin/30-app-container.sh || systemctl stop "corenova-$CFNOVA_APP_NAME"
+                      if nginx -t; then systemctl restart nginx || systemctl stop nginx; else systemctl stop nginx; fi
+                    else
+                      systemctl stop nginx
+                    fi
+                    echo '[corenova] HTTPS failed; restored private configuration or stopped nginx (no public HTTP fallback)' >&2
+                  fi
+                  rm -rf "$BACKUP"
+                  exit "$rc"
+                }
+                trap rollback EXIT
+                trap 'exit 1' HUP INT TERM
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update
+                apt-get install -y certbot
+                systemctl stop nginx
+                certbot certonly --standalone --non-interactive --agree-tos --no-eff-email \
+                  --preferred-challenges http --cert-name "$HOST" -d "$HOST" --email="$EMAIL" \
+                  --server https://acme-v02.api.letsencrypt.org/directory
+                # nginx is still private until the certificate and application-native URL are ready.
+                systemctl start nginx
+                cat > "$BACKUP/https.env" <<EOF
+                export CFNOVA_HTTPS_HOSTNAME='$HOST'
+                export CFNOVA_APP_URL='https://$HOST'
+                export CFNOVA_SERVER_NAMES='$HOST'
+                export CFNOVA_TLS_PEM_PATH='/etc/nginx/tls/corenova.pem'
+                export CFNOVA_SELF_SIGNED_TLS=false
+                export CFNOVA_ALLOWED_WEB_CIDR='0.0.0.0/0'
+                export CFNOVA_ADMIN_AUTH=true
+                EOF
+                chmod 0600 "$BACKUP/https.env"
+                mv -f "$BACKUP/https.env" /opt/corenova/etc/https.env
+                /opt/corenova/bin/renew-https.sh
+                /opt/corenova/bin/30-app-container.sh
+                /opt/corenova/bin/10-nginx-base.sh
+                install -d -m 0755 /etc/letsencrypt/renewal-hooks/{pre,deploy,post}
+                printf '#!/bin/sh\nexec systemctl stop nginx\n' > /etc/letsencrypt/renewal-hooks/pre/corenova-nginx
+                printf '#!/bin/sh\nnginx -t && exec systemctl start nginx\n' > /etc/letsencrypt/renewal-hooks/post/corenova-nginx
+                chmod 0755 /etc/letsencrypt/renewal-hooks/{pre,post}/corenova-nginx
+                ln -sf /opt/corenova/bin/renew-https.sh /etc/letsencrypt/renewal-hooks/deploy/corenova-https
+                systemctl enable --now certbot.timer
+                COMMITTED=true
+                echo "[corenova] HTTPS enabled: https://$HOST; private SSM port 80 remains available."
+                echo '[corenova] Whole-site Basic protection is retained. Read /opt/corenova/credentials/admin.txt through SSM as root.'
+                echo '[corenova] Open inbound TCP 80 (ACME/redirect) and 443 in your security group only when ready; this script changes no AWS resources.'
+                # END SYNCED ASSET enable-https.sh
+              mode: "000755"
+              owner: root
+              group: root
+            /opt/corenova/bin/renew-https.sh:
+              content: |
+                #!/bin/bash
+                # BEGIN SYNCED ASSET renew-https.sh
+                # Certbot deploy hook: swap the key+chain as one root-only PEM, with rollback on reload failure.
+                set +x
+                set -euo pipefail
+                [ "$EUID" -eq 0 ] && [ "$#" -eq 0 ] || exit 1
+                umask 077
+                . /opt/corenova/etc/https.env
+                HOST="${CFNOVA_HTTPS_HOSTNAME:?}"
+                [[ "$HOST" =~ ^[a-z0-9][a-z0-9.-]+$ ]] || exit 1
+                LINEAGE="/etc/letsencrypt/live/$HOST"
+                [ "${RENEWED_LINEAGE:-$LINEAGE}" = "$LINEAGE" ] || exit 0
+                openssl x509 -in "$LINEAGE/cert.pem" -noout -checkhost "$HOST"
+                openssl x509 -in "$LINEAGE/cert.pem" -noout -checkend 86400
+                openssl verify -verify_hostname "$HOST" -CAfile /etc/ssl/certs/ca-certificates.crt -untrusted "$LINEAGE/chain.pem" "$LINEAGE/cert.pem"
+                CERT_KEY="$(openssl x509 -in "$LINEAGE/cert.pem" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum)"
+                PRIVATE_KEY="$(openssl pkey -in "$LINEAGE/privkey.pem" -pubout -outform DER | sha256sum)"
+                [ "$CERT_KEY" = "$PRIVATE_KEY" ] || { echo '[corenova] certificate/key mismatch' >&2; exit 1; }
+                install -d -m 0700 /etc/nginx/tls
+                PEM=/etc/nginx/tls/corenova.pem
+                TMP="$(mktemp /etc/nginx/tls/.corenova-pem.XXXXXX)"
+                BACKUP="$(mktemp /etc/nginx/tls/.corenova-backup.XXXXXX)"
+                HAD_PEM=false
+                if [ -f "$PEM" ]; then cp -p "$PEM" "$BACKUP"; HAD_PEM=true; fi
+                cleanup() { rm -f "$TMP" "$BACKUP"; }
+                trap cleanup EXIT
+                cat "$LINEAGE/privkey.pem" "$LINEAGE/fullchain.pem" > "$TMP"
+                chmod 0600 "$TMP"
+                mv -f "$TMP" "$PEM"
+                reload_nginx() {
+                  nginx -t || return 1
+                  if systemctl is-active --quiet nginx; then systemctl reload nginx; fi
+                }
+                if ! reload_nginx; then
+                  if [ "$HAD_PEM" = true ]; then mv -f "$BACKUP" "$PEM"; else rm -f "$PEM"; fi
+                  reload_nginx || systemctl stop nginx
+                  exit 1
+                fi
+                # END SYNCED ASSET renew-https.sh
+              mode: "000755"
+              owner: root
+              group: root
             /opt/corenova/bin/00-packages-and-docker-runtime.sh:
               content: |
-                # BEGIN SYNCED ASSET 00-packages-and-docker-runtime.sh
                 #!/bin/bash
+                # BEGIN SYNCED ASSET 00-packages-and-docker-runtime.sh
                 # cfn-init asset: installs the Docker engine on a public (unmodified) Ubuntu AMI.
                 # Filename must keep the substring "docker" - platformref.compute_revisions() keys
                 # docker_runtime_revision off it, and the Platform Contract invalidation rule §5 depends on it.
@@ -560,12 +890,14 @@ Resources:
               group: root
             /opt/corenova/bin/10-nginx-base.sh:
               content: |
-                # BEGIN SYNCED ASSET 10-nginx-base.sh
                 #!/bin/bash
+                # BEGIN SYNCED ASSET 10-nginx-base.sh
                 # cfn-init asset: renders the nginx reverse proxy that fronts every CoreNova app container.
                 # Filename keeps the substring "nginx" so platformref.compute_revisions() can key
                 # nginx_base_revision off it (Platform Contract §2.1 public-mode mapping).
-                set -xeuo pipefail
+                set +x
+                set -euo pipefail
+                . /opt/corenova/bin/05-access-policy.sh
 
                 APP_NAME="${CFNOVA_APP_NAME:?}"
                 CONTAINER_PORT="${CFNOVA_CONTAINER_PORT:?}"
@@ -590,11 +922,6 @@ Resources:
                 # 与我们这份 conf 并存会让 nginx -t 直接失败（实测 duplicate default server）。
                 rm -f /etc/nginx/sites-enabled/default
 
-                if [ -n "$TLS_PEM_PATH" ] && [ ! -s "$TLS_PEM_PATH" ]; then
-                  echo "[corenova] WARN: TlsPemPath=$TLS_PEM_PATH is missing or empty, 443 stays closed"
-                  TLS_PEM_PATH=""
-                fi
-
                 if [ -z "$TLS_PEM_PATH" ] && [ "$SELF_SIGNED_TLS" = "true" ]; then
                   # Golden Verification must measure a real 443 listener; a self-signed bundle is enough because
                   # the probe asserts reachability through the SG, not certificate trust.
@@ -615,20 +942,34 @@ Resources:
                 AUTH_LINES=""
                 ADMIN_GEO=""
                 if [ "$ADMIN_AUTH" = "true" ]; then
+                  umask 077
                   install -d -m 0700 /opt/corenova/credentials
                   if [ ! -s /opt/corenova/credentials/admin.txt ]; then
-                    ADMIN_PASS="$(openssl rand -hex 12)"
+                    ADMIN_PASS="$(openssl rand -hex 24)"
                     printf 'corenova:%s\n' "$ADMIN_PASS" > /opt/corenova/credentials/admin.txt
                   fi
                   chown root:root /opt/corenova/credentials/admin.txt
                   chmod 0600 /opt/corenova/credentials/admin.txt
-                  ADMIN_PASS="$(cut -d: -f2 /opt/corenova/credentials/admin.txt)"
-                  printf 'corenova:%s\n' "$(openssl passwd -6 "$ADMIN_PASS")" > /etc/nginx/corenova-admin.htpasswd
+                  ADMIN_PASS="$(cut -d: -f2- /opt/corenova/credentials/admin.txt)"
+                  printf 'corenova:%s\n' "$(printf '%s\n' "$ADMIN_PASS" | openssl passwd -6 -stdin)" > /etc/nginx/corenova-admin.htpasswd
+                  unset ADMIN_PASS
                   chown root:www-data /etc/nginx/corenova-admin.htpasswd
                   chmod 0640 /etc/nginx/corenova-admin.htpasswd
-                  ADMIN_GEO='geo $corenova_admin_realm { default "CoreNova admin access"; 127.0.0.1 ""; ::1 ""; }'
+                  umask 022
+                  ADMIN_GEO='geo $corenova_admin_realm { default "CoreNova admin access"; 127.0.0.1 off; ::1 off; }'
                   AUTH_LINES='  auth_basic $corenova_admin_realm;
                   auth_basic_user_file /etc/nginx/corenova-admin.htpasswd;'
+                fi
+
+                # The HTTP server rejects remote requests before auth or proxy execution.
+                HTTP_GUARD='if ($corenova_remote) { return 403; }'
+                if [ "$GOLDEN_HTTP" = true ]; then
+                  HTTP_GUARD=''
+                elif [ -n "$TLS_PEM_PATH" ]; then
+                  HTTPS_ORIGIN="$(python3 -c 'import sys; from urllib.parse import urlsplit; p=urlsplit(sys.argv[1]); print("https://"+p.netloc if p.scheme=="https" else "")' "$CFNOVA_APP_URL")"
+                  if [ -n "$HTTPS_ORIGIN" ]; then
+                    HTTP_GUARD="if (\$corenova_remote) { return 308 ${HTTPS_ORIGIN}\$request_uri; }"
+                  fi
                 fi
 
                 cat > /etc/nginx/snippets/corenova-app.conf <<EOF
@@ -646,6 +987,7 @@ Resources:
                   proxy_set_header X-Real-IP \$remote_addr;
                   proxy_set_header X-Forwarded-For \$remote_addr;
                   proxy_set_header X-Forwarded-Proto \$scheme;
+                  proxy_set_header Authorization \$corenova_authorization;
                   proxy_set_header Upgrade \$http_upgrade;
                   proxy_set_header Connection \$connection_upgrade;
                   proxy_read_timeout 3600s;
@@ -657,6 +999,8 @@ Resources:
 
                 cat > /etc/nginx/conf.d/corenova-proxy.conf <<EOF
                 map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
+                geo \$corenova_remote { default 1; 127.0.0.1 0; ::1 0; }
+                map "\$scheme:\$corenova_remote" \$corenova_authorization { default \$http_authorization; "http:1" ""; }
                 ${ADMIN_GEO}
 
                 upstream corenova_${APP_NAME} {
@@ -668,6 +1012,7 @@ Resources:
                   listen 80 default_server;
                   listen [::]:80 default_server;
                   server_name _ ${SERVER_NAMES};
+                  ${HTTP_GUARD}
                   access_log /var/log/nginx/corenova-${APP_NAME}.access.log;
                   include /etc/nginx/snippets/corenova-app.conf;
                 }
@@ -721,8 +1066,8 @@ Resources:
               group: root
             /opt/corenova/bin/20-cloudwatch-agent.sh:
               content: |
-                # BEGIN SYNCED ASSET 20-cloudwatch-agent.sh
                 #!/bin/bash
+                # BEGIN SYNCED ASSET 20-cloudwatch-agent.sh
                 # cfn-init asset: CloudWatch agent install + the log/metric collection config for a CoreNova host.
                 set -xeuo pipefail
 
@@ -772,12 +1117,14 @@ Resources:
               group: root
             /opt/corenova/bin/30-app-container.sh:
               content: |
-                # BEGIN SYNCED ASSET 30-app-container.sh
                 #!/bin/bash
+                # BEGIN SYNCED ASSET 30-app-container.sh
                 # cfn-init asset: renders the systemd unit that runs the application container.
                 # Nothing about the app image or port is baked in - both arrive as CFN parameters, so the same
                 # template verifies Ghost today and any other registered app tomorrow.
-                set -xeuo pipefail
+                set +x
+                set -euo pipefail
+                . /opt/corenova/bin/05-access-policy.sh
 
                 APP_NAME="${CFNOVA_APP_NAME:?}"
                 IMAGE_REFERENCE="${CFNOVA_IMAGE_REFERENCE:?}"
@@ -825,19 +1172,8 @@ Resources:
                   fi
                 done
 
-                # LaunchUrl is optional because the instance public DNS name only exists after launch.
-                # Resolve it through IMDSv2 so apps such as Ghost receive a correct absolute base URL.
-                if [ -z "$APP_URL" ]; then
-                  set +x
-                  IMDS_TOKEN="$(curl -fsS --connect-timeout 2 --max-time 5 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token || true)"
-                  if [ -n "$IMDS_TOKEN" ]; then
-                    PUBLIC_DNS="$(curl -fsS --connect-timeout 2 --max-time 5 -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" http://169.254.169.254/latest/meta-data/public-hostname || true)"
-                    if [ -n "$PUBLIC_DNS" ]; then
-                      APP_URL="http://${PUBLIC_DNS}"
-                    fi
-                  fi
-                  set -x
-                fi
+                # URL policy supplies the private SSM default, never an inferred public HTTP URL.
+                mountpoint -q "$DATA_DIR" || { echo '[corenova] data volume is not mounted'; exit 1; }
 
                 # 规范化根 URL，追加环境变量中的 / 不会生成双斜杠。
                 APP_URL="${APP_URL%/}"
@@ -913,11 +1249,13 @@ Resources:
                 Description=CoreNova application container (${APP_NAME})
                 After=docker.service network-online.target
                 Requires=docker.service
+                RequiresMountsFor=${DATA_DIR}
 
                 [Service]
                 Type=simple
                 Restart=always
                 RestartSec=5
+                ExecStartPre=/usr/bin/mountpoint -q ${DATA_DIR}
                 ExecStartPre=-/usr/bin/docker rm -f ${APP_NAME}
                 ExecStartPre=/usr/bin/docker pull ${IMAGE_REFERENCE}
                 ExecStart=/usr/bin/docker run --rm --name ${APP_NAME} \\
@@ -947,8 +1285,8 @@ Resources:
               group: root
             /opt/corenova/bin/40-ready-and-signal.sh:
               content: |
-                # BEGIN SYNCED ASSET 40-ready-and-signal.sh
                 #!/bin/bash
+                # BEGIN SYNCED ASSET 40-ready-and-signal.sh
                 # cfn-init asset: prove the platform end-to-end locally, then answer the WaitConditionHandle.
                 # This is the only place a deployment may declare itself ready; Golden Verification reads the
                 # signal as cfn_signal_received and /run/corenova-cfn-init.rc as cfn_init_completed.
@@ -999,6 +1337,10 @@ Resources:
           # Writing and running are separate configsets, so `--configsets signal` can be re-run by
           # hand without reinstalling the platform underneath.
           commands:
+            00-mount-data:
+              command: /bin/bash -c '. /opt/corenova/etc/init.env; exec /opt/corenova/bin/01-mount-data.sh'
+              cwd: /tmp
+              timeout: "1200"
             00-packages-and-docker-runtime:
               command: /bin/bash -c '. /opt/corenova/etc/init.env; exec /opt/corenova/bin/00-packages-and-docker-runtime.sh'
               cwd: /tmp
@@ -1108,26 +1450,7 @@ Resources:
               exit 101
             fi
 
-            # --- Mount data volume -------------------------------------------------------
-            # The data volume (/dev/sdf) persists across instance terminations (DeleteOnTermination: false).
-            # First boot: format ext4. Subsequent boots: mount the existing filesystem.
-            DATA_DEV=/dev/sdf
-            DATA_MOUNT=/var/lib/corenova/app/data
-            if [ -b "$DATA_DEV" ]; then
-              if ! blkid "$DATA_DEV" >/dev/null 2>&1; then
-                echo "[corenova] formatting data volume $DATA_DEV as ext4"
-                mkfs.ext4 -m 0 -L corenova-data "$DATA_DEV"
-              fi
-              mkdir -p "$DATA_MOUNT"
-              mount -o noatime "$DATA_DEV" "$DATA_MOUNT"
-              if ! grep -q "$DATA_MOUNT" /etc/fstab; then
-                echo "$DATA_DEV $DATA_MOUNT ext4 defaults,noatime 0 2" >> /etc/fstab
-              fi
-              echo "[corenova] data volume mounted at $DATA_MOUNT"
-            else
-              echo "[corenova] WARNING: $DATA_DEV not found — data volume skipped"
-            fi
-
+            # cfn-init mounts the identified data volume before any runtime asset runs.
             OVERRIDE=""
             if [ -n "${InitOverrideUrl}" ]; then
               if curl -fsSL "${InitOverrideUrl}" -o /opt/corenova/etc/init-override.json; then
@@ -1145,6 +1468,12 @@ Resources:
               > >(tee /var/log/corenova/cfn-init.log) 2>&1 || INIT_RC=$?
             echo "$INIT_RC" > /run/corenova-cfn-init.rc
             echo "[corenova] cfn-init(default) exit=$INIT_RC"
+            if [ "$INIT_RC" -ne 0 ]; then
+              systemctl stop corenova-${AppName} nginx || true
+              cfn-signal -e "$INIT_RC" '${WaitHandle}' || curl -fsS -X PUT -H 'Content-Type:' \
+                -d '{"Status":"FAILURE","Reason":"cfn-init or data mount failed","UniqueId":"corenova-bootstrap","Data":"1"}' '${WaitHandle}'
+              exit "$INIT_RC"
+            fi
 
             systemctl daemon-reload || true
             for unit in docker nginx corenova-${AppName}; do
@@ -1179,14 +1508,26 @@ Outputs:
     Value: {Fn::GetAtt: [Instance, PrivateIp]}
 
   ResolvedLaunchUrl:
-    Description: Public entry point (falls back to the instance public DNS when LaunchUrl is empty).
+    Description: Initial application URL; defaults to the private SSM tunnel at localhost:8080. Later HTTPS state is stored on the instance.
     Value:
       Fn::If:
         - LaunchUrlGiven
         - {Ref: LaunchUrl}
-        - {Fn::Sub: "http://${Instance.PublicDnsName}"}
+        - "http://localhost:8080"
     Export:
       Name: {Fn::Sub: "${AWS::StackName}-LaunchUrl"}
+
+  SSMPortForwardCommand:
+    Description: Run locally with AWS CLI and Session Manager plugin, then open http://localhost:8080 to initialize the application privately.
+    Value:
+      Fn::Sub: >-
+        aws ssm start-session --region '${AWS::Region}' --target '${Instance}'
+        --document-name AWS-StartPortForwardingSession
+        --parameters '{"portNumber":["80"],"localPortNumber":["8080"]}'
+
+  EnableHttpsCommand:
+    Description: After private app initialization, point DNS A only at PublicIp and allow inbound TCP 80/443 for ACME/HTTPS. Run as root through SSM; Basic credentials remain in /opt/corenova/credentials/admin.txt (not an output).
+    Value: "sudo /opt/corenova/bin/enable-https.sh <hostname> <acme-email> --confirm-initialized"
 
   RoleArn:
     Value: {Fn::GetAtt: [Role, Arn]}

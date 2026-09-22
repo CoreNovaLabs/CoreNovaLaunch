@@ -2,7 +2,9 @@
 # cfn-init asset: renders the systemd unit that runs the application container.
 # Nothing about the app image or port is baked in - both arrive as CFN parameters, so the same
 # template verifies Ghost today and any other registered app tomorrow.
-set -xeuo pipefail
+set +x
+set -euo pipefail
+. /opt/corenova/bin/05-access-policy.sh
 
 APP_NAME="${CFNOVA_APP_NAME:?}"
 IMAGE_REFERENCE="${CFNOVA_IMAGE_REFERENCE:?}"
@@ -50,19 +52,8 @@ for protocol in tcp udp; do
   fi
 done
 
-# LaunchUrl is optional because the instance public DNS name only exists after launch.
-# Resolve it through IMDSv2 so apps such as Ghost receive a correct absolute base URL.
-if [ -z "$APP_URL" ]; then
-  set +x
-  IMDS_TOKEN="$(curl -fsS --connect-timeout 2 --max-time 5 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token || true)"
-  if [ -n "$IMDS_TOKEN" ]; then
-    PUBLIC_DNS="$(curl -fsS --connect-timeout 2 --max-time 5 -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" http://169.254.169.254/latest/meta-data/public-hostname || true)"
-    if [ -n "$PUBLIC_DNS" ]; then
-      APP_URL="http://${PUBLIC_DNS}"
-    fi
-  fi
-  set -x
-fi
+# URL policy supplies the private SSM default, never an inferred public HTTP URL.
+mountpoint -q "$DATA_DIR" || { echo '[corenova] data volume is not mounted'; exit 1; }
 
 # 规范化根 URL，追加环境变量中的 / 不会生成双斜杠。
 APP_URL="${APP_URL%/}"
@@ -138,11 +129,13 @@ cat > "/etc/systemd/system/corenova-${APP_NAME}.service" <<EOF
 Description=CoreNova application container (${APP_NAME})
 After=docker.service network-online.target
 Requires=docker.service
+RequiresMountsFor=${DATA_DIR}
 
 [Service]
 Type=simple
 Restart=always
 RestartSec=5
+ExecStartPre=/usr/bin/mountpoint -q ${DATA_DIR}
 ExecStartPre=-/usr/bin/docker rm -f ${APP_NAME}
 ExecStartPre=/usr/bin/docker pull ${IMAGE_REFERENCE}
 ExecStart=/usr/bin/docker run --rm --name ${APP_NAME} \\

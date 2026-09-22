@@ -1,0 +1,94 @@
+# CoreNova Launch · 应用注册（App Schema 唯一事实源）
+# 契约：contracts/app-schema.md（校验规则见 §5，共 19 条）
+# 实测 ghcr.io/coder/code-server:4.137.0 (linux/amd64)：/ 跳转到登录页；
+# `code-server --version` 首列为 4.137.0。
+
+app:
+  name: "code-server"
+  category: "devops"
+  app_type: "stateful_app"
+  icon: "/icons/code-server.svg"   # Repo A 静态资产，需人工预置（缺失时官网回退字母头像）
+  i18n:
+    en:
+      display_name: "code-server"
+      description: "Run VS Code in a browser on your own cloud instance"
+    zh:
+      display_name: "code-server 云端开发环境"
+      description: "在自己的云主机上通过浏览器使用 VS Code"
+
+source:
+  repo: "coder/code-server"
+  version_strategy: "release_tag"
+  release_filter:
+    prerelease: false
+    draft: false
+
+deploy:
+  docker_image: "ghcr.io/coder/code-server"
+  image_tag_template: "ghcr.io/coder/code-server:{version_no_v}"
+  container_port: 8080
+  compose_file: "apps/code-server/docker-compose.yml"
+  # extra_environment: []   # 可选：one-click 模板注入的 KEY=VALUE；含敏感词会被拒绝（规则16）
+
+health_check:
+  endpoint: "/"
+  expected_status: 200
+  method: "GET"
+  timeout_seconds: 5
+  retries: 40
+  interval_seconds: 3
+  startup_timeout_seconds: 180
+  version_assertion:
+    kind: "exec_command"
+    command: >-
+      code-server --version | head -n 1 | awk '{print $1}'
+    expected: "{version_no_v}"
+    match: "exact"
+
+tests:
+  predefined_dir: "apps/code-server/tests"
+  scenarios:
+    - slug: "login"
+      url: "/"
+      caption:
+        en: "Sign-in page"
+        zh: "登录页"
+
+deployment:
+  size: "small"
+  documentation_url: "https://coder.com/docs/code-server"
+  regions: ["us-east-1"]  # v1 单区域（规则14）
+  # L1.5 生产核对声明（deployment-contract.md §2.6）：真实一次性栈上逐项实证，
+  # 全部通过即满足规则21 的解除条件，由 production-verify 自动清 hold。
+  production_contract:
+    checks: ["data_dir_write"]
+  # 运维性部署暂停（app-schema.md 规则21）：独立于历史验证结果；
+  # 解除条件是生产契约重新验证通过，不是版本更新。
+  hold:
+    reason:
+      en: "Deployment paused pending production data-directory permission verification."
+      zh: "暂停部署：待完成生产数据目录权限验证。"
+  post_deploy:
+    admin_path: "/"
+    admin_setup:
+      en: "Open / and use the generated credential stored in /home/coder/.config/code-server/config.yaml; retrieve it through AWS Systems Manager Session Manager."
+      zh: "打开 /，使用 /home/coder/.config/code-server/config.yaml 中生成的访问凭据；可通过 AWS Systems Manager Session Manager 查看。"
+    notes:
+      - en: "The entire /home/coder directory is retained so projects, settings and extensions survive container replacement."
+        zh: "完整 /home/coder 目录会被保留，替换容器后项目、设置和扩展仍在。"
+  cost_estimate:
+    monthly_usd: 23
+    note:
+      en: "Verified default in us-east-1: t3.small, 20 GB root plus 30 GB data gp3, and public IPv4; transfer and snapshots are extra."
+      zh: "us-east-1 已验证默认配置：t3.small、20GB 系统盘、30GB 数据盘与公网 IPv4；流量和快照另计。"
+  data_path: "/home/coder"
+
+website:
+  featured: false
+  screenshots_order: ["login"]
+  tags: ["development", "vscode", "browser-ide"]
+  features:
+    - en: "A full VS Code experience from any modern browser"
+      zh: "在任何现代浏览器中使用完整 VS Code 体验"
+    - en: "Projects, settings and extensions persist on a retained volume"
+      zh: "项目、设置与扩展持久保存在数据卷"

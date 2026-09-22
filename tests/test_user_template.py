@@ -37,7 +37,8 @@ def test_merged_template_has_no_cross_stack_exports(tmp_path):
     tpl = build(tmp_path)
     outputs = tpl.get("Outputs") or {}
     # 一键部署用户只需要入口地址和定位实例的 ID（网络/ IAM 等落地细节已剔除）
-    assert set(outputs) == {"InstanceId", "PublicIp", "PublicDnsName", "PrivateIp", "ResolvedLaunchUrl"}
+    assert set(outputs) == {"InstanceId", "PublicIp", "PublicDnsName", "PrivateIp", "ResolvedLaunchUrl",
+                            "SSMPortForwardCommand", "EnableHttpsCommand"}
     for key, o in outputs.items():
         assert "Export" not in o, f"Output {key!r} 仍带 Export 块：{o.get('Export')}"
 
@@ -109,8 +110,10 @@ def render_asset(tmp_path, name, overrides=None, extra_env=""):
     """执行真实 Bash 资产，仅替换主机路径和外部系统命令，禁止接触宿主机服务。"""
     data = tmp_path / "data"
     data.mkdir(exist_ok=True)
-    for path in ("opt/etc", "systemd", "nginx/conf.d", "logrotate"):
+    for path in ("opt/etc", "opt/bin", "systemd", "nginx/conf.d", "logrotate"):
         (tmp_path / path).mkdir(parents=True, exist_ok=True)
+    policy = (ROOT / "templates/cloudformation/fixed/init/05-access-policy.sh").read_text()
+    (tmp_path / "opt/bin/05-access-policy.sh").write_text(policy.replace("/opt/corenova", str(tmp_path / "opt")))
     extra_file = tmp_path / "opt/etc/extra.env"
     extra_file.write_text(extra_env)
     text = (ROOT / "templates/cloudformation/fixed/init" / name).read_text()
@@ -136,6 +139,7 @@ stat() {
 }
 curl() { printf '%s\n' "$MOCK_DNS"; }
 systemctl() { :; }
+mountpoint() { return "${MOCK_MOUNT_RC:-0}"; }
 sleep() { :; }
 apt-get() { :; }
 nginx() { :; }
@@ -171,15 +175,17 @@ def test_runtime_resolves_legacy_url_and_native_url_wins(tmp_path):
     assert "docker.sock" not in unit
 
 
-def test_runtime_resolves_imds_url(tmp_path):
+def test_runtime_defaults_to_private_ssm_url(tmp_path):
     proc = render_asset(tmp_path, "30-app-container.sh", {
         "CFNOVA_APP_URL": "", "CFNOVA_APP_URL_ENV_NAME": "ROOT_URL",
-    })
+    }, "X=${CORENOVA_APP_URL}/")
     assert proc.returncode == 0, proc.stderr
-    assert "ROOT_URL=http://ec2.example.test\n" in (tmp_path / "opt/env/demo.env").read_text()
+    env = (tmp_path / "opt/env/demo.env").read_text()
+    assert "ROOT_URL=http://localhost:8080\n" in env
+    assert "X=http://localhost:8080/\n" in env
 
 
-@pytest.mark.parametrize("extra", ["X=${UNSUPPORTED}", "X=${CORENOVA_APP_URL}/", "X=a\rb"])
+@pytest.mark.parametrize("extra", ["X=${UNSUPPORTED}", "X=a\rb"])
 def test_runtime_fails_closed_on_invalid_or_unresolved_environment(tmp_path, extra):
     proc = render_asset(tmp_path, "30-app-container.sh", {
         "CFNOVA_APP_URL": "", "MOCK_DNS": "",
@@ -315,6 +321,8 @@ def test_real_nginx_upload_websocket_and_acl(tmp_path):
         docker("image", "inspect", image)
     proc = render_asset(tmp_path, "10-nginx-base.sh", {
         "CFNOVA_SELF_SIGNED_TLS": "true", "CFNOVA_MAX_BODY_MB": "2",
+        "CFNOVA_GOLDEN_MODE": "true", "CFNOVA_APP_NAME": "corenova-canary",
+        "CFNOVA_ADMIN_AUTH": "false",
     })
     assert proc.returncode == 0, proc.stderr
     fixture = tmp_path / "nginx"

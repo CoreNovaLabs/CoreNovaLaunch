@@ -56,10 +56,15 @@ def build(root: Path) -> dict:
             if k == "TerminationProtection":
                 # 一键评估默认不锁定实例（用户可显式选 Enabled）；三栈生产模板保持 Enabled
                 v["Default"] = "Disabled"
+            if k == "HttpIngressCidr":
+                v["Default"] = "127.0.0.1/32"
+            if k == "LaunchUrl":
+                v["Default"] = "http://localhost:8080"
             parameters[k] = v
 
-    # 一键部署用户只需要入口地址和定位实例的 ID，其余是三栈内部落地细节（噪声）。
-    keep_outputs = {"InstanceId", "PublicIp", "PublicDnsName", "PrivateIp", "ResolvedLaunchUrl"}
+    # 保留可复制的私有初始化命令和部署后 HTTPS 入口，不输出任何密码。
+    keep_outputs = {"InstanceId", "PublicIp", "PublicDnsName", "PrivateIp", "ResolvedLaunchUrl",
+                    "SSMPortForwardCommand", "EnableHttpsCommand"}
     outputs: dict = {}
     for src in (net, app):
         for k, v in (src.get("Outputs") or {}).items():

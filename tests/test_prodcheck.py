@@ -361,7 +361,9 @@ def test_run_checks_isolates_probe_crash(fast_poll, monkeypatch):
 # --------------------------------------------------------------------------- hold 文本手术
 
 
-HOLD_SOURCE = (REPO_ROOT / "apps" / "code-server.yaml").read_text(encoding="utf-8")
+# 冻结 fixture：解除暂停是生产核对的正常结果，活跃 apps/*.yaml 迟早不再有 hold；
+# 拿真实注册表文件当 strip_hold 的输入等于写一个会在成功那天变红的测试。
+HOLD_SOURCE = (REPO_ROOT / "tests" / "fixtures" / "held-code-server.yaml").read_text(encoding="utf-8")
 
 
 def test_strip_hold_on_real_app_file():
