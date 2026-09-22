@@ -217,6 +217,9 @@ Manifest: https://pub-xxxx.r2.dev/candidates/ghost/123456/2/<verification_id>/sc
   证据绑定生产 run/attempt、时间、真实 SSM 会话、完整参数及 `cleanup_confirmed=true`。
 - **核对范围**：始终要求 `stack_created`、`template_match`、`public_access_denied`、`health_external`；
   公网 80/443 拒绝探测不发送凭据，健康检查经实际 SSM 转发。
+  健康探测只在隧道内跟随重定向（`Location` 越出 `127.0.0.1` 即拒，并按该 3xx 判红）：容器阶段由
+  urllib 跟随同一端点的重定向，两层因此对“根路径 302 到登录页”的应用（code-server）同判健康，
+  L1.5 既不因转发写法更严，也不因跟随而把凭据送出会话。
   声明项仍为 `admin_auth`（代理认证要求纳入 `health_external`）、`data_dir_write`
   （以镜像用户向数据卷写删文件）、`url_injection`（应用 URL 与私有 LaunchUrl 一致）、
   `host_metrics`（声明的宿主机只读挂载可用）。以 `corenova/prodcheck.py` 的逐项报告为证，

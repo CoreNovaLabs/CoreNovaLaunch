@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from . import golden
 from .appspec import AppSpec
@@ -246,17 +246,38 @@ def _redact(ctx: CheckCtx, text: str) -> str:
     return text[:600]
 
 
-def _http_status(ctx: CheckCtx, url: str, headers: dict[str, str]) -> int:
+def _guarded_get(ctx: CheckCtx, url: str, headers: dict[str, str]) -> tuple[int, dict]:
+    """One GET inside the established tunnel. The guard sits on the call so no hop can slip past it."""
     parsed = urlsplit(url)
     if headers and (not ctx.session_id or parsed.hostname != "127.0.0.1"
                     or not url.startswith(ctx.tunnel_url + "/")):
         raise ValueError("credentials may only use the established SSM tunnel")
     try:
-        status, _, _ = ctx.http_get(url, headers)
-        return int(status)
+        status, resp_headers, _ = ctx.http_get(url, headers)
+        return int(status), resp_headers
     except Exception as exc:  # noqa: BLE001 - fail closed; never log auth-bearing errors
         log(f"http probe failed: {type(exc).__name__}")
-        return 0
+        return 0, {}
+
+
+def _followed_status(ctx: CheckCtx, url: str, headers: dict[str, str], max_hops: int = 3):
+    """(final status, final url, off-tunnel Location that was refused — '' when there was none).
+
+    Redirects are chased only while they stay on the tunnel origin. The container-stage probe lets
+    urllib follow them, so an app whose root answers `/` -> `/login` is healthy there and must not
+    be red here; a hop off loopback is refused and reported, because the Basic credential must
+    never leave the session.
+    """
+    code, headers_seen = _guarded_get(ctx, url, headers)
+    for _ in range(max_hops):
+        if not 300 <= code < 400:
+            return code, url, ""
+        target = urljoin(url, headers_seen.get("location") or headers_seen.get("Location") or "")
+        if not target.startswith(ctx.tunnel_url + "/"):
+            return code, url, urlsplit(target).netloc or "<no Location>"
+        code, headers_seen = _guarded_get(ctx, target, headers)
+        url = target
+    return code, url, ""
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -267,14 +288,15 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def tunnel_http_get(url, headers):
     if urlsplit(url).hostname != "127.0.0.1":
         raise ValueError("SSM HTTP target must be loopback")
-    # No proxies, no redirects (including auth-bearing redirects to the public web).
+    # No proxies, no automatic redirects (including auth-bearing redirects to the public web);
+    # the caller in _followed_status decides which hops to take, so the Location must survive.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     req = urllib.request.Request(url, headers=headers)
     try:
         with opener.open(req, timeout=20) as response:
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as exc:
-        return exc.code, {}, b""
+        return exc.code, dict(exc.headers or {}), b""
 
 
 def verify_public_template(manifest):
@@ -409,22 +431,27 @@ def _check_health_external(ctx: CheckCtx) -> CheckResult:
     if not path.startswith("/") or path.startswith("//"):
         return CheckResult("health_external", False, "invalid health path")
     url = ctx.tunnel_url + path
-    seen = {"code": 0}
+    seen = {"code": 0, "url": url, "refused": ""}
 
     def probe():
-        seen["code"] = _http_status(ctx, url, {})
+        seen["code"], seen["url"], seen["refused"] = _followed_status(ctx, url, {})
         # Loopback exemption is intentional for private SSM access. Only obtain
         # Basic credentials if the private endpoint actually challenges us.
         if seen["code"] == 401 and ctx.plan.parameters.get("AdminAuthEnabled") == "true":
             if not ctx.secret and not _fetch_admin_credentials(ctx):
                 return None
             token = base64.b64encode(f"{ADMIN_USER}:{ctx.secret}".encode()).decode()
-            seen["code"] = _http_status(ctx, url, {"Authorization": f"Basic {token}"})
+            seen["code"], seen["url"], seen["refused"] = _followed_status(
+                ctx, url, {"Authorization": f"Basic {token}"})
         return True if 200 <= seen["code"] < 300 else None
 
     ok = poll_until(probe, timeout_s=HEALTH_POLL_TIMEOUT_S, interval_s=HEALTH_POLL_INTERVAL_S) is True
+    hop = f" -> {urlsplit(seen['url']).path}" if seen["url"] != url else ""
+    if seen["refused"]:
+        hop = f" (refused hop to {seen['refused']})"
     return CheckResult("health_external", ok,
-                       f"runner -> SSM port-forward -> nginx HTTP={seen['code']}; credentials confined to tunnel")
+                       f"runner -> SSM port-forward -> nginx HTTP={seen['code']}{hop}; "
+                       "credentials confined to tunnel")
 
 
 def _check_data_dir_write(ctx: CheckCtx) -> CheckResult:

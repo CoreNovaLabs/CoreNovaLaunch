@@ -240,6 +240,55 @@ def test_private_tunnel_loopback_exemption_needs_no_credentials(fast_poll):
     assert scripts == []  # authenticated SSM access, no public Basic auth
 
 
+def _redirect_ctx(http_get, health_path="/"):
+    plan_ = make_plan({"AdminAuthEnabled": "false", "HealthCheckPath": health_path},
+                      ["health_external"])
+    ctx = CheckCtx(plan=plan_, instance_id="i-1", public_dns="ec2-1-2.compute-1.amazonaws.com",
+                   container="app", image_ref="app", data_path="/data",
+                   run_script=lambda script: inv(""), http_get=http_get,
+                   tunnel_url="http://127.0.0.1:8080", session_id="test-session")
+    return ctx
+
+
+def test_health_follows_redirects_that_stay_in_the_tunnel(fast_poll):
+    # code-server answers / with 302 -> /login. The container stage has always let urllib chase
+    # that, so L1.5 must not be stricter about the same declared endpoint.
+    routes = {"http://127.0.0.1:8080/": (302, {"location": "/login"}, b""),
+              "http://127.0.0.1:8080/login": (200, {}, b"<html>")}
+    result = prodcheck.CHECK_FNS["health_external"](
+        _redirect_ctx(lambda url, h: routes[url]))
+    assert result.passed, result.detail
+    assert "HTTP=200 -> /login" in result.detail  # evidence says which hop answered
+
+
+def test_health_never_chases_a_redirect_out_of_the_tunnel(fast_poll):
+    calls = []
+
+    def http_get(url, headers):
+        calls.append(url)
+        return 302, {"location": "https://public.example/login"}, b""
+
+    result = prodcheck.CHECK_FNS["health_external"](_redirect_ctx(http_get))
+    assert not result.passed
+    assert "HTTP=302 (refused hop to public.example)" in result.detail
+    assert set(calls) == {"http://127.0.0.1:8080/"}  # refused at the origin, nothing fetched off-tunnel
+
+
+def test_tunnel_http_get_keeps_the_location_of_a_refused_redirect(monkeypatch):
+    # _NoRedirect turns a 3xx into HTTPError. If that branch swallowed its headers, the hop loop
+    # in _followed_status would see a redirect with no target and every app that redirects at the
+    # root would go red again -- and no fake http_get would notice, because they bypass this helper.
+    err = prodcheck.urllib.error.HTTPError(
+        "http://127.0.0.1:8080/", 302, "Found", {"location": "/login"}, None)
+
+    class Opener:
+        def open(self, req, timeout=None):
+            raise err
+
+    monkeypatch.setattr(prodcheck.urllib.request, "build_opener", lambda *a: Opener())
+    assert prodcheck.tunnel_http_get("http://127.0.0.1:8080/", {}) == (302, {"location": "/login"}, b"")
+
+
 def test_health_admin_auth_missing_credentials_file(fast_poll):
     ctx, _ = admin_ctx(lambda s: inv(code=1, error="No such file"), lambda h: 401)
     result = prodcheck.CHECK_FNS["health_external"](ctx)
@@ -458,7 +507,7 @@ def test_assert_projection_rejects_malformed(tmp_path, pc):
 def test_credentials_never_leave_established_tunnel(url):
     ctx, _ = admin_ctx(lambda s: inv(""), lambda h: pytest.fail("HTTP must not be called"))
     with pytest.raises(ValueError, match="credentials"):
-        prodcheck._http_status(ctx, url, {"Authorization": "Basic secret"})
+        prodcheck._followed_status(ctx, url, {"Authorization": "Basic secret"})
 
 
 def test_instance_curl_alone_never_counts_as_access(fast_poll):
