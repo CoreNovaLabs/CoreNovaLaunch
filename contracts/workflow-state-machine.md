@@ -2,16 +2,19 @@
 
 > 优先级：**最高**。
 > 术语：本文沿用 Repo A / Repo B / Repo C 代号，分别指 `CoreNovaLaunchWebsite`（官网，本地目录 `website/`）、`CoreNovaLaunchAmi`（AMI 构建，引导期未落地）、`CoreNovaLaunch`（验证枢纽）。
-> 适用：Repo C 的所有验证/部署工作流（Application Verification 与 Platform Verification）。
+> 适用：Repo C 的所有验证/部署工作流（Application Verification 的容器阶段、L1.5 生产核对、Platform Verification）。
 > 本文保证流程确定性：同一时刻每个 app 的状态唯一、可追溯。任何设计文档与之冲突，以本文为准。
 
 ## 1. 状态总表
 
 ```
-DISCOVERED ─▶ RESOLVED ─▶ (DEPLOYING ─▶ DEPLOYED) ─▶ VERIFYING ─▶ VERIFIED
-                                                              │
-                                                              ▼
-                                                          PUBLISHING ─▶ PUBLISHED
+                          ┌── 无 production_contract（旧路径）──────────────────────────────────┐
+                          │                                                                    ▼
+DISCOVERED ─▶ RESOLVED ─▶ VERIFYING ─▶ VERIFIED ─┤                                              PUBLISHING ─▶ PUBLISHED
+  ▲   ▲                                           │                                                  ▲
+  │   │                                           └─▶ CANDIDATE_READY ─▶ DEPLOYING ─▶ DEPLOYED ─┘
+  │   │                                                            （仅 L1.5 生产核对，见 §3）
+  │   └─ RETRY（TRANSIENT，最多 3 次指数退避）
 
 任何 VERIFYING/PUBLISHING/DEPLOYING 失败 ─▶ FAILED
 FAILED ─┬─ TRANSIENT        ─▶ RETRY（唯一可自动重试，最多 3 次指数退避）
@@ -30,33 +33,52 @@ FAILED ─┬─ TRANSIENT        ─▶ RETRY（唯一可自动重试，最多 
 |------|------|---------|
 | `DISCOVERED` | 版本监控发现新版本/新应用/手动触发 | workflow run 开始 |
 | `RESOLVED` | 已解析 app_version、docker_image、docker_digest、platform_contract | 写入 run 上下文 |
-| `DEPLOYING` | **仅 Platform Verification**：CFN canary 栈创建/更新中 | canary stack 状态 |
-| `DEPLOYED` | **仅 Platform Verification**：EC2 已起、cfn-init 完成、cfn-signal 收到 | — |
-| `VERIFYING` | 跑验证（Application：compose+Playwright；Platform：AWS 资源探针） | — |
+| `DEPLOYING` | **Platform Verification 与 L1.5 生产核对**：CFN 栈（canary / 一次性核对栈）创建或更新中 | stack 状态 |
+| `DEPLOYED` | **Platform Verification 与 L1.5 生产核对**：EC2 已起、cfn-init 完成、cfn-signal 收到 | — |
+| `VERIFYING` | 跑验证（Application：compose+Playwright；Platform：AWS 资源探针；生产核对：真实栈上的外部探针） | — |
 | `VERIFIED` | 验证通过，但尚未发布 | 生成 Manifest（未上传 current） |
-| `PUBLISHING` | 上传 R2 + 发 repository_dispatch | R2 写入中 |
+| `CANDIDATE_READY` | **仅声明 `deployment.production_contract` 的应用**：容器阶段全绿，产物已隔离暂存，等待生产核对 | `candidates/{app}/{run}/{attempt}/{vid}/manifest.json` |
+| `PUBLISHING` | 上传 R2 + 发 repository_dispatch；候选应用为**生产核对通过后的 CAS 晋级**（`promote`） | R2 写入中 |
 | `PUBLISHED` | 已发布，网站事实源更新 | `current.json` 已更新 |
 | `FAILED` | 任一阶段失败，进入子分类 | issue / PR |
 | `RETRY` | 瞬时失败自动重试 | 重新进入 `VERIFYING` |
 | `FIX_PR` | 等待修复 PR（由人工在流水线外发起，见 §6；流水线本身不连 AI） | PR |
 | `MANUAL_REQUIRED` | 需人工介入 | 标注 issue |
 
-## 3. 两层状态机差异
+## 3. 三条路径的差异
 
-### Application Verification（默认，无 AWS）
+### 3.1 Application Verification · 容器阶段（每次版本更新）
 ```
-DISCOVERED → RESOLVED → VERIFYING → VERIFIED → PUBLISHING → PUBLISHED
+DISCOVERED → RESOLVED → VERIFYING → VERIFIED → (PUBLISHING → PUBLISHED | CANDIDATE_READY)
                                   ↘ FAILED → (RETRY | FIX_PR | MANUAL_REQUIRED)
 ```
-- **不进入 `DEPLOYING` / `DEPLOYED`**（无 EC2、无 CFN 部署）。
+- 本阶段**不创建 AWS 资源、不部署 CloudFormation**，因此在 GitHub Actions 上零 AWS 费用。
+- 分支由 app 是否声明 `deployment.production_contract.checks`（规则 22）决定：
+  - **未声明**：`VERIFIED` 后直接走 `PUBLISHING → PUBLISHED`（旧路径，verification-manifest.md §6.2 的 P1–P5）。
+  - **已声明**：`VERIFIED` 后进入 `CANDIDATE_READY`——产物写入隔离前缀 `candidates/{app}/{run}/{attempt}/{vid}/`，
+    **不写** `current.json`、版本记录与索引。**`CANDIDATE_READY` 不是 `PUBLISHED`**，即使九项 checks 全绿也不代表已发布。
 - `RESOLVED` 阶段复用既有有效 Platform Contract（`verification.platform = referenced`）。
 
-### Platform Verification（AWS Golden，低频）
+### 3.2 L1.5 生产核对 + 晋级（仅候选应用，deployment-contract.md §2.6）
+```
+CANDIDATE_READY → DEPLOYING → DEPLOYED → VERIFYING(prodcheck) → PUBLISHING(promote, CAS) → PUBLISHED
+       │               │           │              │
+       │               │           │              └─ 核对/清理未确认 → FAILED（旧稳定发布保持）
+       │               └───────────┴─ 真实 AWS 一次性用户栈：会产生费用，跑完必须删干净
+       └─ 候选过期、身份不符、CAS 冲突 → FAILED（不晋级）
+```
+- 由 `application-verify.yml` 在 `CANDIDATE_READY` 后 dispatch `production-verify.yml`，输入是**精确候选引用 JSON**，
+  不允许按应用名回落到 current/latest。链条断掉时候选保持不动，旧稳定发布不受影响。
+- 本阶段与容器阶段共用 `verify-<app>` 并发组（§5），晋级前重读 main 的策略：新增 hold 或 config 变更会使旧候选失效。
+- **晋级必须原样保留已登记的 `deploy.hold`**：核对全绿不是解除暂停的授权，人工 hold 永不自动清除。
+- 清理未确认（`cleanup_confirmed`）即判 `FAILED`，不得晋级。
+
+### 3.3 Platform Verification（AWS Golden，低频）
 ```
 DISCOVERED → RESOLVED → DEPLOYING → DEPLOYED → VERIFYING → VERIFIED → PUBLISHING → PUBLISHED
                                                                   ↘ FAILED → (RETRY | FIX_PR | MANUAL_REQUIRED)
 ```
-- `DEPLOYING`/`DEPLOYED` 仅此处使用。
+- `DEPLOYING`/`DEPLOYED` 在本路径与 §3.2 使用，容器阶段（§3.1）不进入。
 - `PUBLISHED` 含义 = 标记 Platform Contract `status=valid`（见 platform-contract.md），并生成 `platform_verification_id` 供后续 Application Verification 引用。
 
 ## 4. `FAILED` 子分类与 Retry 规则
@@ -159,9 +181,15 @@ platform_verification_id: plat-us-east-1-x86_64-20260827-001
 4. 人工**关闭** issue = 显式放弃该次重试（脚本不得自动重开已关闭 issue）。
 5. `APPLICATION` / `TEST` / `INFRASTRUCTURE` / `MANUAL_REQUIRED` 四类**永不**被 `reverify-failed` 自动触发——只有 `TRANSIENT` 有自动重试资格（§4）。
 
+**覆盖范围**：台账只记录 §3.1 容器阶段的失败。§3.2 的 L1.5 生产核对失败**不写 issue**，其载体是 run 结论与
+始终上传的 `prodcheck-{run}-{attempt}` 证据 artifact（`production-verify.yml`），因为候选本身已带精确身份且不会污染稳定发布。
+
 ## 8. 反模式
 
-- ❌ Application Verification 进入 `DEPLOYING`/`DEPLOYED`。
+- ❌ 容器阶段（§3.1）进入 `DEPLOYING`/`DEPLOYED`：AWS 资源只在生产核对（§3.2）与 Golden Verification（§3.3）里创建。
+- ❌ 把 `CANDIDATE_READY` 当作已发布，或让候选产物写进公开 `current.json` / 版本 / 索引。
+- ❌ 生产核对未全绿、清理未确认、候选已过期或 CAS 冲突时仍然晋级；旧稳定发布必须保持原样。
+- ❌ 晋级时顺手清除 `deploy.hold`（人工 hold 永不自动清除，见 deployment-contract.md §2.5/§2.6）。
 - ❌ 对所有 `FAILED` 统一 `RETRY`。
 - ❌ AI 修复越权改基础设施/安全工作流。
 - ❌ 旧版本覆盖新版本 `current.json`。

@@ -119,14 +119,14 @@ deployment:                           # required, 网站展示用的静态部署
       zh: "已验证默认配置：t3.small 约 $15.2 + 50GB gp3 约 $4 + 公网 IPv4 约 $3.65/月。"
   data_path: "/var/lib/ghost/content" # optional, string；容器内数据挂载目录（与 compose 文件的容器目标一致），
                                       # 是 CFN DataContainerPath 参数的真相源；必须以 / 开头（§5 规则19）
-  app_url_env_name: "url"             # optional, string；接收公开访问 URL 的应用原生环境变量名
-                                      # （Ghost 为 url）；值由 CFN 按 LaunchUrl/PublicDnsName 注入（规则20）
+  app_url_env_name: "url"             # optional, string；接收应用访问 URL 的原生环境变量名
+                                      # （Ghost 为 url）；默认注入私有 LaunchUrl=http://localhost:8080（规则20）
   production_contract:                # optional, L1.5 生产核对声明（规则22，deployment-contract.md §2.6）：
-                                      # 新版本发布后在真实 AWS 一次性栈上逐项实证，全过即自动解除 hold
+                                      # 先候选，真实 AWS 精确核对及清理确认后才晋级；不自动解除人工 hold
     checks: ["admin_auth", "data_dir_write"]  # 非空、去重，值 ∈ {admin_auth, data_dir_write, url_injection, host_metrics}
   hold:                               # optional, 运维性部署暂停（规则21）：独立于历史验证结果，
                                       # “已验证”≠“当前可部署”；官网拦截所有部署入口并展示原因。
-                                      # 解除条件是生产契约重新验证通过（不是版本更新），移除后重跑 sync_holds
+                                      # 人工重新核对后移除，再跑 sync_holds；自动验证/晋级永不清除
     reason:                           # required, Localized；暂停原因（双语），官网原样渲染
       en: "Deployment paused pending production-contract re-verification."
       zh: "暂停部署：待完成生产契约重新验证。"
@@ -293,7 +293,7 @@ health_check:
 19. `stateful_app` 必须声明 `deployment.data_path`；其他类型若声明也必须为以 `/` 开头的字符串；含空格或 shell 元字符（`;&|`$`）则校验失败。该值必须与应用 compose 文件的容器挂载目标一致——它是 CFN `DataContainerPath` 参数的唯一真相源，compose / CFN / extra_environment 三处不得各自硬编码导致漂移。
 20. `deployment.app_url_env_name` 若存在，必须匹配 `^[A-Za-z_][A-Za-z0-9_]*$`。它只声明应用原生变量名；变量值由 CloudFormation 在启动时根据显式 `LaunchUrl` 或实例 `PublicDnsName` 生成，禁止 app schema、前端或模板写死部署地址。
 21. `deployment.hold` 若存在：必须是映射且仅含 `reason` 键；`reason` 的 `en`/`zh` 均非空，且含 `secret`/`password`/`token`/`private_key`（不区分大小写）即校验失败。hold 是**运维性部署暂停**，独立于验证结果（`status: verified` 的应用也可能被 hold）；声明后投影进 `current.json` 的 `deploy.hold`，官网以此拦截全部部署入口。发布与解除走 `scripts/verify/sync_holds.py`（条件写，不动 versions/、index 与任何验证字段），不等下一次验证——否则“hold 拦住验证 → hold 字段永远进不了发布数据”死锁。
-22. `deployment.production_contract` 若存在：必须是映射且仅含 `checks` 键；`checks` 为非空、无重复的 string[]，每项 ∈ {`admin_auth`, `data_dir_write`, `url_injection`, `host_metrics`}。它是 L1.5 生产核对的声明式清单（deployment-contract.md §2.6）：新版本发布后 `production-verify.yml` 在真实 AWS 一次性栈上逐项实证，全过即自动删除 `deployment.hold`（解除的唯一自动化路径）；核对项同时决定深链必须携带的模板参数（`admin_auth`→`AdminAuthEnabled`、`host_metrics`→`HostMetricsAccess`），投影为 `current.json` 的 `deploy.production_contract.checks`。`checks` 含 `data_dir_write` 时应用必须声明 `deployment.data_path`（规则19）；含 `url_injection` 时必须存在注入通道——`deployment.app_url_env_name`（规则20）或含 `${CORENOVA_APP_URL}` 占位符的 `deploy.extra_environment`，二者皆无则核对没有对象可测，校验失败。
+22. `deployment.production_contract` 若存在：必须是映射且仅含 `checks` 键；`checks` 为非空、无重复的 string[]，每项 ∈ {`admin_auth`, `data_dir_write`, `url_injection`, `host_metrics`}。它声明 L1.5 **发布前**生产门禁（deployment-contract.md §2.6）：先把 Manifest、报告、截图隔离到 `candidates/{app}/{run}/{attempt}/{verification_id}/`，`CANDIDATE_READY` 不是发布；`production-verify.yml` 核对同 Manifest SHA、digest、模板 revision/CFN 实际模板、私有 SSM 参数及清理确认后，才 CAS current 并更新版本与索引。24 小时新鲜度、latest 候选意图/run/attempt、app config hash 与 current etag 均须通过；任一失败不晋级。**人工 hold 永不自动清除**，须人工重新核对后移除 yaml 再 sync_holds。核对项同时决定深链模板参数（`admin_auth`→`AdminAuthEnabled`、`host_metrics`→`HostMetricsAccess`），投影为 `deploy.production_contract.checks`；默认 `LaunchUrl=http://localhost:8080`、`AllowedWebCidr=127.0.0.1/32`、`SelfSignedTls=false`。无该声明仍走旧 P1–P5，不能宣称有生产验收。`checks` 含 `data_dir_write` 时必须声明 `deployment.data_path`（规则19）；含 `url_injection` 时须有 `deployment.app_url_env_name`（规则20）或含 `${CORENOVA_APP_URL}` 的 `deploy.extra_environment`，否则校验失败。
 
 ## 6. 反模式
 
@@ -311,7 +311,7 @@ health_check:
 - ❌ 前端猜测应用接收公开 URL 的变量名，或在 `extra_environment` 写死主机名（必须来自 `deployment.app_url_env_name`，规则 20）。
 - ❌ 把 `ami_id` / `region` 写进 app schema（那是平台层契约，归 Platform Contract）。
 - ❌ 用版本重新验证代替暂停解除：`deployment.hold` 的解除条件是生产契约重新验证通过，验证流水线也不负责写入 hold（那是 sync_holds 的运维路径，规则 21）。
-- ❌ 把 hold 的解除寄托于人工反复演练而不声明 `production_contract`：核对项可枚举的应用必须走 L1.5 自动化（规则 22），否则"自动更新即可部署"永远闭不了环。
+- 禁止把生产核对全绿当成自动删除人工 hold 的授权，或用旧 current 的证据晋级新候选；生产门禁与人工暂停是独立控制（规则 21/22）。
 
 ## 7. 部署模型边界：当前为单容器（2026-08-30 明确）
 

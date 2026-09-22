@@ -10,8 +10,9 @@ App registration → Version & image resolution → Container verification → P
                                               Platform Contract
 ```
 
-- **Application Verification** runs Docker Compose, readiness checks, version assertions, predefined tests, and Playwright screenshots. It does not create AWS resources.
-- **Publish Gate** commits manifests, reports, screenshots, and indexes through a two-phase process; the website consumes published data instead of inferring verification results.
+- **Application Verification** runs the container stage: Docker Compose, readiness checks, version assertions, predefined tests, and Playwright screenshots. This stage creates no AWS resources.
+- **Production Check** gates release for apps that declare `deployment.production_contract`: the container stage only stages an isolated candidate, then `production-verify` creates a one-off real stack, probes it over SSM, and promotes by CAS only after every check and the cleanup confirmation pass. It creates billable resources. Apps without the declaration keep the legacy two-phase publish path.
+- **Publish Gate** commits manifests, reports, screenshots, and indexes through a two-phase process; the website consumes published data instead of inferring verification results. Promotion never clears a manually registered `deploy.hold`.
 - **Golden Verification** separately tests the AWS platform and produces a Platform Contract. It creates billable resources.
 
 This repository does not build AMIs or implement the website. The production publishing path remains single-container v1; experimental stack v2 does not replace existing deployments.
@@ -200,11 +201,13 @@ The Publish Gate requires all nine checks before committing `current.json`. R2 w
 | --- | --- |
 | `pr-checks` | Lint, app-schema validation, and repository tests. |
 | `monitor-versions` | Discover upstream versions every six hours. |
-| `application-verify` | Verify and publish an application with app-level concurrency control. |
+| `application-verify` | Run the container stage for an application with app-level concurrency control; publish directly, or stage a candidate when `deployment.production_contract` is declared. |
+| `production-verify` | Check an exact candidate on a real one-off stack and, only after cleanup is confirmed, promote it by CAS. Shares the `verify-<app>` concurrency group; creates billable resources. |
 | `golden-verify` | Verify the AWS platform on dispatch or on the 1st and 16th of each month. |
 | `publish-template` | Publish the one-click template and check anonymous readability. |
 | `publish-site` | Notify the website repository to rebuild. |
 | `reverify-failed` | Retry failures classified as `TRANSIENT`. |
+| `sync-holds` | Project `deployment.hold` from `apps/*.yaml` into published `current.json` without touching verification data. |
 
 ## Reference
 

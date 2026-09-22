@@ -226,7 +226,8 @@
 | `platform.base_ami_source` | Platform Contract | 每次验证变 | `public` \| `custom`（公开 AMI 引导期 vs 自建/收费 AMI 期），见 platform-contract.md §2.1 |
 | `config.tests_revision` | `apps/{app}/tests/**` 的 git SHA（未提交回退内容哈希） | 测试变更时变 | 钉住产生本次 `tests_passed` 的测试版本，见 §4.3 |
 | `config.template_revision` / `website.deploy.template.revision` | one-click 模板合并输出的内容 SHA（未提交回退内容哈希） | 模板源变更时变 | 钉住产生本次证据的部署模板版本，对账 `deploy.template`，见 deployment-contract.md §2.4 |
-| `website.deploy.production_contract` | app schema `deployment.production_contract` 投影（`{"checks": [...]}`） | 声明变更时变 | L1.5 生产核对声明，深链据此携带保护参数，hold 据此自动解除，见 deployment-contract.md §2.6；无声明时省略键 |
+| `website.deploy.production_contract` | app schema `deployment.production_contract` 投影（`{"checks": [...]}`） | 声明变更时变 | 发布前候选生产门禁与深链参数声明，不自动解除人工 hold；见 deployment-contract.md §2.6，无声明省略键 |
+| `verification_run_attempt` / `website.verification_run_attempt` | 候选 stage 的 Actions run attempt（字符串） | 每次 attempt 变 | 本轮候选新增投影；与 run_id 一起排序/隔离，旧路径可缺省（§6.4） |
 | `website.deploy.hold` | app schema `deployment.hold` 投影 | 运维态，**非证据** | 只随 `current.json` 发布；发布器写 `versions/<version>.json` 时剥离（不可变证据不冻结运维态），消费口径见 deployment-contract.md §2.5 |
 | `website.features` / `website.deploy.docker_image` / `website.release.type_evidence` / `website.workflow_run_url` | app schema + 运行时解析 | 投影 | 前端直接消费的字段，必须由生成器从顶层/artifacts 投影，禁止手写第二份 |
 
@@ -280,9 +281,9 @@ version_assertion 通过（应用自报版本 == app_version）
 
 `website` 段是专门给前端消费的扁平投影。它与顶层存在同名冗余字段（`app`、`app_version`、`verification_id`、`verification_run_id`、`verified_at`、`platform_verification_id`、`ami_id`、`region`、`architecture`），这些**值必须与顶层严格相等**，由 Manifest 生成器写入、CI 校验，禁止各自独立维护。
 
-- `current.json`（R2）**完全等于** `manifest.website` 段——逐字段 1:1，不增不减。`verification_run_id` 亦随投影进入 current.json：版本覆盖保护在"版本不可 semver 比较"时需要它作为唯一裁决依据（workflow-state-machine.md §5），否则该规则无数据可用。
+- `current.json`（R2）的验证字段逐字段等于 `manifest.website`。`verification_run_id` 随投影进入 current；候选分支新增 `verification_run_attempt` 顶层/website 同值投影，二者共同参与候选新旧排序（§6.4）。**运维投影例外：`deploy.hold` 使用 current 实时值**，可由 sync_holds 条件更新；promote 保留人工 hold，不把候选创建时的旧状态覆盖到新 current。
   - `website` 段除内联 identity 字段外，还包含前端直接消费的内容字段：`display_name` / `description` / `category` / `icon` / `featured` / `tags` / `health` / `status` / `report_url` / `deploy{...}` / `release{...}` / `screenshots_order` / `screenshots[]`。其中 `report_url` 由 `artifacts.report_url` 投影、`screenshots[]` 与 `screenshots_order` 由 `artifacts.screenshots[]` 投影（顺序与 `screenshots_order` 一致，且 ≡ `tests.scenarios[].name`，见 app-schema §5 规则 8）。
-- `versions/{app_version}.json`（R2）**完全等于** 完整 Manifest 本身（含顶层 + 嵌套 + website 段）。
+- `versions/{app_version}.json`（R2）保留完整 Manifest 验证证据，但**剥离 `website.deploy.hold`**，不可变证据不得冻结实时运维态。这是上述 1:1 投影的明确例外，不允许借此增删其他证据字段；历史版本显示的暂停状态一律以 current 为准。
 - 前端只读 `current.json`，不读完整 Manifest 嵌套；因此 `website` 段是唯一的前端字段事实源。
 
 ## 5. `verification.platform` 取值
@@ -303,7 +304,9 @@ version_assertion 通过（应用自报版本 == app_version）
 
 `checks.screenshots_uploaded`、`checks.report_uploaded`、`checks.verification_manifest_uploaded` 三项描述的是**上传动作的结果**。若要求它们在上传发生前就为 `true`，逻辑上不可能成立（Manifest 里写"我已上传"的那次上传正是待验证的上传本身）。旧文档在此处自相矛盾，本节给出可执行时序。
 
-### 6.2 正式时序（PUBLISHING 阶段）
+### 6.2 兼容时序（无 production_contract 的旧 P1–P5）
+
+仅无 `deployment.production_contract` 声明的应用保留此路径；有声明的必须走 §6.4，不能先写 versions 再补生产核对。
 
 ```
 P0  门禁前置：6 项本地 checks 必须已为 true
@@ -332,15 +335,52 @@ P5  提交点（唯一）：写 current.json，再更新 verified/index.json
 
 ### 6.3 语义与不变式
 
-- **`current.json` 存在即门禁通过**：只有九项全 `true` 的最终 Manifest 才有资格写 `current.json`；它是唯一提交点，`versions/` 与 `screenshots/` 只是其证据。
+- **九项全真是发布必要条件，不总是充分条件**：旧路径按 §6.2 提交；有生产声明还须通过 §6.4 的精确候选生产门禁。current 中历史记录不证明本轮新增门禁曾执行，也不表示人工 hold 已解除。
 - 任一 check 为 `false` → **绝不写 `current.json`、绝不更新 `index.json`、绝不发 `repository_dispatch`**（门禁落点）。
 - 中断在 P1–P4 之间：官网仍展示旧 `current.json`；`versions/` 里可能残留一条三项上传 check 为 `false` 的记录——该记录**不得**出现在网站版本页（前端按 `checks` 全真过滤，见 deployment-contract.md §2.1）。
 - 网站展示的版本记录，其九项 check 必须全部来自最终态 Manifest，禁止前端补写或推断。
 
+### 6.4 候选分支（声明 production_contract 时强制）
+
+由 `corenova/candidates.py` 执行，与旧 P1–P5 分支互斥：
+
+```
+C0  六项本地 checks 通过；校验 template revision 与 verified_at 新鲜度
+C1  CAS candidates/{app}/latest.json，先登记数值 run/attempt 排序的候选意图
+C2  上传到 candidates/{app}/{run}/{attempt}/{verification_id}/：
+      screenshots/{file}、report.html、manifest.json、candidate.json
+    资产回读核对哈希、Manifest 回读一致后才返回 CANDIDATE_READY
+    不写 verified/、稳定截图路径、版本清单，也不触发官网发布
+C3  production-verify 使用完整精确候选引用核对：
+      同 manifest SHA / tag@digest / template revision
+      公开模板 SHA + CFN 实际模板 + 私有 SSM 参数 + 真实会话
+      必需及声明探针全通过 + cleanup_confirmed=true
+C4  复核 24h 新鲜度、latest 意图、run/attempt、app config hash、current etag、
+    资产哈希与公开模板内容；任一不符拒绝晋级
+C5  CAS current（保留人工 hold）→ versions → 应用索引 → 版本索引 → 官网通知
+```
+
+- 完整引用含 `app`、`app_version`、`verification_id`、`verification_run_id`、
+  `verification_run_attempt`、`key`、`manifest_sha256`；`key` 为上述候选目录下的 `candidate.json`。
+  SHA-256 按确定性 JSON 编码计算，不能以应用名、版本号或旧 current 代替精确身份。
+- 候选 Manifest 顶层新增字符串 `verification_run_attempt`（Actions attempt，默认 `"1"`），
+  严格同值投影到 `website.verification_run_attempt`，晋级后进入 current 与版本证据。
+  旧 P1–P5 记录可无此字段，比较旧 current 时按 attempt 1 兼容。
+- 候选与验证时间均须在 24 小时内且非未来；生产证据时间必须位于候选创建后、本次核对期间，
+  并绑定生产 run/attempt。`latest` 先记录意图：新 run 即使上传失败，旧候选也不再有晋级资格；
+  重试须新 attempt。数值 `(run, attempt)` 必须更新，且不得 semver 回退。
+- 所有候选对象不可变；晋级仍引用原 `candidates/...` 报告/截图 URL，官网按 URL 原路径镜像。
+  已被 current/versions 引用的资产不得当临时文件 GC；隔离既防并发覆盖，也防旧报告串图。
+- 候选内部 `website.status=verified` 与九项全真只表示证据已就绪，**不是已公开发布**。
+  任一前置核对失败或 CAS 冲突均不 promote、不改变稳定命名空间。
+  C5 的 CAS 与后续版本/索引写入并非跨对象事务，后续写入中断需核对并修复一致性。
+- 当前配置 hash 与 current etag 防止旧 run 覆盖新配置或人工 hold；自动流程永不删人工 hold。
+  hold 的实时投影例外见 §4，精确探针和人工解除流程见 deployment-contract.md §2.5–2.6。
+
 ## 7. current.json、versions/*.json 与 index.json
 
-- `verified/{app}/current.json` = 当前官网应展示的最新 Verified 状态，**逐字段等于**最新一次 `PUBLISHED` 的 Manifest 的 `website` 段（website 段已含扁平化后的 identity 字段，详见 §4 投影权威说明）。
-- `verified/{app}/versions/{app_version}.json` = 该版本的历史 Verification Record（完整 Manifest，最终态）。
+- `verified/{app}/current.json` = 当前官网应展示的最新已发布验证状态；验证字段等于 Manifest 的 `website` 段，`deploy.hold` 为实时投影例外（§4）。
+- `verified/{app}/versions/{app_version}.json` = 该版本的最终态 Verification Record（完整验证证据，剥离 `website.deploy.hold`）。
 - `verified/index.json` = 应用清单（网站可枚举的唯一入口，形状见 deployment-contract.md §2.1）。R2 公共端点不支持 ListObjects，Repo A **无法**自行发现 app 列表，故该文件是链路成立的必要条件，必须在每次 P5 与 current 同批更新。
 - 新版本验证失败 → **旧 `current.json` 与旧 `index.json` 条目保留**，网站上稳定版本不消失。
 - 版本覆盖保护：较旧验证结果不得覆盖较新已发布版本（见 workflow-state-machine.md §5）。

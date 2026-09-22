@@ -20,7 +20,7 @@ R2 = Website Runtime Source of Truth
 
 ## 2. `current.json` 形状（= Manifest 的 website 投影）
 
-`current.json` 逐字段等于 Verification Manifest 的 `website` 段（见 verification-manifest.md §4 投影权威）。`website` 段已内联扁平化后的 identity 字段（`app`、`app_version`、`verification_id`、`verified_at`、`platform_verification_id`、`ami_id`、`region`、`architecture`），因此 `current.json` 不额外携带、也不缺漏任何字段。前端只读 `current.json`：
+`current.json` 的验证字段逐字段等于 Verification Manifest 的 `website` 段（见 verification-manifest.md §4 投影权威）。`website` 段内联 identity 字段；候选另投影 `verification_run_attempt`。**唯一运维投影例外是 `deploy.hold`**：current 使用实时值，版本记录剥离它（§2.5），不得据此改动其他验证字段。以下为旧路径的结构示例，不是本轮实测报告：
 
 ```json
 {
@@ -130,7 +130,14 @@ R2 公共端点**不支持 ListObjects**，Repo A 无法自行发现有哪些 ap
 Manifest: https://pub-xxxx.r2.dev/screenshots/ghost/v5.75.0/home.png
 产物:     dist/screenshots/ghost/v5.75.0/home.png
 渲染:     /screenshots/ghost/v5.75.0/home.png
+
+候选晋级后同理：
+Manifest: https://pub-xxxx.r2.dev/candidates/ghost/123456/2/<verification_id>/screenshots/home.png
+产物:     dist/candidates/ghost/123456/2/<verification_id>/screenshots/home.png
+渲染:     /candidates/ghost/123456/2/<verification_id>/screenshots/home.png
 ```
+
+晋级不搬运/重命名候选资产；只要已发布记录仍引用它们，就必须保留，不能按“临时候选”清理。
 
 - 理由：① R2 公共访问未开启/配错时不至于全站图裂；② 省 R2 egress 与跨域配置；③ 站点不依赖站外链接存活。
 - 该镜像是**构建期搬运**，键路径完全由 Manifest 的 `url` 决定；**前端代码不得自行拼路径或猜文件名**（§6 反模式仍成立）。
@@ -184,37 +191,89 @@ Manifest: https://pub-xxxx.r2.dev/screenshots/ghost/v5.75.0/home.png
   前端只消费覆写后的数据。
 - **多版本部署**：暂停是应用级——暂停中全部版本不可部署；解除后凡证据完整（运行时契约字段
   齐备，见 §2.2/规则消费口径）的历史版本立即可部署，深链按各自 Manifest 的 digest 钉扎。
-- **解除条件**：生产契约重新验证通过（含 AWS 真实部署核对），不是版本更新；解除 = 移除 yaml 里的
-  `hold` 后重跑 `sync_holds.py --app <app>` 清除 `deploy.hold`。该重新核对已由 L1.5 生产核对门禁
-  （§2.6）自动化：核对全绿即由 `production-verify.yml` 删 hold 并触发 sync-holds。
-- **迁移窗口（已关闭，2026-09-20）**：R2 旧数据尚无 `deploy.hold` 字段时，官网构建期兜底表
-  （`deploymentSafety.ts`）曾继续拦截暂停应用；兜底表只允许缩小。现所有已发布
-  `current.json` 均携带该字段，兜底表清空为**永久禁止再添加条目**——L1.5（§2.6）从 Repo C
-  自动解除 hold 时无法同步修改 Repo A 的构建期表，残留条目会在暂停已解除后继续静默拦截官网。
+- **解除条件**：人工重新核对生产契约及暂停原因（含所需 AWS 实证），确认后人工移除 yaml 的
+  `hold`，再运行 `sync_holds.py --app <app>` 清除实时 `deploy.hold`。**人工 hold 永不自动清除**：
+  版本更新、候选核对全绿或 promote 均不是解除授权；promote 必须保留原 hold。
+  核对中新增/修改 hold 会改变 app config hash 或 current etag，使旧候选失效。
+- **迁移边界**：已迁出的官网构建期兜底表不得再添加条目。暂停只由 yaml → `current.json`
+  实时投影控制，不能以历史版本快照或前端名单代替；是否已完成存量迁移须现场核对，本文不追认云端状态。
 
-### 2.6 L1.5 生产核对门禁（production check）："验证通过"到"可部署"的自动化桥
+### 2.6 L1.5 生产核对门禁（production check）：先候选，后晋级
 
-本地应用验证（compose + Playwright）不接触 AWS，永远产不出"生产语义正确"的证据，
-hold 因此无法靠版本更新解除。L1.5 把这条核对自动化：新版本发布后，在真实 AWS 建一个
-**一次性用户栈**（与用户经深链部署的同一份公开模板、同一 digest 钉扎镜像），逐项实证后删栈。
+容器阶段（Compose + Playwright）不创建 AWS 资源；声明了 `deployment.production_contract`
+的应用必须先暂存候选，再由 `production-verify.yml` 在真实 AWS 建一次性用户栈核对，
+**在核对与清理确认之前不得发布**。这是这些应用的发布门禁，不是发布后的补测或自动解暂停任务。
 
-- **声明**：`apps/*.yaml` 的 `deployment.production_contract.checks`（app-schema.md 规则22），
-  取值子集：`admin_auth`（整站 Basic 保护：无凭据 401、带凭据 200）、`data_dir_write`
-  （以镜像声明用户向数据卷写删文件）、`url_injection`（URL 环境变量注入生效）、
-  `host_metrics`（宿主机指标只读挂载可用）。核对结论由 `corenova/prodcheck.py` 写入
-  `data/runs/prodcheck-*.json` 证据。
-- **解除闭环**：全部 checks 通过 → `production-verify.yml` 删除该应用 yaml 的 `hold`
-  并 push（sync-holds.yml 自动清 R2 `deploy.hold`）；任一失败 → 不碰 yaml，hold 保持。
-  人工解除路径仍然有效（演练实证，如 gitea/portainer 2026-09-19）。
-- **深链联动**：核对项决定模板参数——`admin_auth` 对应 `AdminAuthEnabled=true`、
-  `host_metrics` 对应 `HostMetricsAccess=true`。Manifest 把声明投影为
-  `current.json` 的 `deploy.production_contract.checks`，官网深链必须按声明携带对应参数，
-  否则部署形态退回核对前的未保护基线（§3 表）。
-- **成本与卫生**：栈名 `corenova-prodcheck-<app>-<version>-<run>`，打 tag
-  `corenova:prodcheck=true`；无论成败 finally 删栈并扫残留数据卷；密码只存在于核对进程内存，
-  证据与日志一律脱敏。
-- **边界**：L1.5 不改变九项验证 check 的语义，也不是发布门禁——发布照常，
-  它只决定 hold 的解除；未声明 `production_contract` 的应用不受影响。
+- **候选隔离**：`corenova/candidates.py` 把 Manifest、报告、截图存入
+  `candidates/{app}/{run}/{attempt}/{verification_id}/`。`CANDIDATE_READY` 不等于 `PUBLISHED`，
+  即使候选九项 checks 全真、内嵌 `website.status=verified`，也不进入公开 current、versions 或索引。
+  官网仅消费已晋级记录；晋级后仍引用原不可变候选资产，按 URL 原路径镜像，不能当临时文件 GC。
+- **精确身份**：传递完整候选引用（app、version、verification_id、verification_run_id、
+  verification_run_attempt、key、manifest_sha256），不得按应用名取旧 current 代替。
+  核对同一 Manifest SHA、精确 `tag@digest`、模板 revision 和公开模板内容，检查 CFN 实际模板一致；
+  证据绑定生产 run/attempt、时间、真实 SSM 会话、完整参数及 `cleanup_confirmed=true`。
+- **核对范围**：始终要求 `stack_created`、`template_match`、`public_access_denied`、`health_external`；
+  公网 80/443 拒绝探测不发送凭据，健康检查经实际 SSM 转发。
+  声明项仍为 `admin_auth`（代理认证要求纳入 `health_external`）、`data_dir_write`
+  （以镜像用户向数据卷写删文件）、`url_injection`（应用 URL 与私有 LaunchUrl 一致）、
+  `host_metrics`（声明的宿主机只读挂载可用）。以 `corenova/prodcheck.py` 的逐项报告为证，
+  不能把这组探针扩大为完整业务、可信 TLS 或恢复验收。
+- **访问参数**：核对与默认深链均使用 `LaunchUrl=http://localhost:8080`、
+  `AllowedWebCidr=127.0.0.1/32`、`SelfSignedTls=false`；`admin_auth` 对应
+  `AdminAuthEnabled=true`，`host_metrics` 对应 `HostMetricsAccess=true`。
+  声明投影为 `deploy.production_contract.checks`，前端不按应用名猜参数。
+- **新鲜度与并发**：Manifest 验证时间和候选创建时间均须在 24 小时内且不得来自未来；
+  `candidates/{app}/latest.json` 在上传前以 CAS 保留最新候选意图，按数值 `(run, attempt)` 排序。
+  新 run 即使上传失败也会淘汰旧意图；重试需新 attempt。另拒绝 semver 回退。
+  Application/production 工作流共用 `verify-<app>` 并发组；晋级前重读 app config hash、
+  current etag、latest、资产哈希及公开模板 SHA，防旧 run 和人工 hold 竞争。
+- **晋级顺序**：全部核对及清理确认通过后，CAS 更新 `current.json`，再写版本记录、应用索引与版本索引，
+  最后通知官网。任一前置核对失败、过期、身份不符或 CAS 冲突均不 promote，旧稳定发布保持。
+  CAS 之后的版本/索引写入不是跨对象事务；若中断须排查并修复发布一致性，不得声称已完整发布。
+- **成本与清理**：一次性生产核对栈会产生 AWS 费用；无论成败均清理栈、确认残留数据卷已清理。
+  `keep-stack` 或清理未确认不得晋级。凭据仅经 SSM 获取，报告、日志不得含凭据。
+- **兼容边界**：无 `production_contract` 的应用仍走 verification-manifest.md §6.2 的旧 P1–P5；
+  九项 checks 的含义不变，不能把全目录宣传为已有生产或业务验收。本文描述门禁要求，
+  本轮仅有本地验证工作，真实 AWS 验收仍需实际报告，不声称已通过。
+
+### 2.7 默认私有访问与可选可信 HTTPS
+
+新模板默认使用 §2.6 的私有参数，CFN Outputs 提供 `InstanceId`、`SSMPortForwardCommand`、
+`ResolvedLaunchUrl`。用户准备 AWS CLI、Session Manager 插件及目标实例会话权限，在本机运行输出命令，
+保持本机 8080 → 实例 80 的 SSM 转发，打开 `http://localhost:8080` 完成管理员初始化与实际操作。
+不开放 SSH 或容器原始端口，不把转发端口共享出去；`CREATE_COMPLETE` 不表示账号已初始化。
+
+可选 HTTPS 必须先私有初始化，再经 SSM 执行
+`sudo /opt/corenova/bin/enable-https.sh DOMAIN EMAIL --confirm-initialized`：
+
+- `--confirm-initialized` 是人工确认，不是脚本自动检测应用账号。
+- 公共 DNS 仅以 A 记录直指本机当前公网 IPv4，不得有 AAAA 或未验证代理；操作人员手动放行
+  ACME 签发/续期所需 TCP 80，并按预期用户来源放行 TCP 443。
+- Certbot 申请可信证书并配置续期；失败不能退回公开 HTTP。HTTPS 仍为**全站随机 Basic 保护**，
+  代理凭据仅经 SSM 读取实例 `/opt/corenova/credentials/admin.txt`，与应用管理员账号不同。
+- 公网 HTTP 不接受认证（仅 ACME 验证/跳转）；本机 HTTP 经 SSM 加密传输不是公网明文登录。
+  匿名博客、公开状态页和外部 Webhook 可能被全站 Basic 阻止，不能声称已可用。
+- 停止再启动可能更换公网 IP，须重新核对 DNS；旧实例不会因模板更新自动获得这些行为。
+  证书签发、续期及外部访问必须在 AWS 实验中逐项核对，不能由本地测试追认。
+
+### 2.8 数据卷、费用与退出
+
+启动必须校验数据卷身份，仅确认空盘才允许格式化；已有文件系统不得重格式化。
+通过 UUID fstab 与 systemd mount 依赖/挂载保护防止应用把数据写到未挂载的系统盘目录，
+卷身份、文件系统或挂载校验失败即终止。静态/本地测试不能证明真实 EC2 重启与 EBS 恢复已通过。
+
+费用至少包括**实例 + 20GB 系统盘 + 实际数据盘 + 公网 IPv4**；额外流量、快照、日志另计，
+地区、用量与价格以账单为准。`deploy.data_volume_gb` 是数据盘，不是系统盘。
+
+| 操作 | 资源与数据语义 |
+|------|----------------|
+| Stop 实例 | 停止计算运行，不删栈、不删 EBS；磁盘、快照、日志及仍保留的计费地址资源继续计费。 |
+| 删除栈 | 删除模板管理且未保留的资源；失败/回滚也须检查残留，不能等同零费用。 |
+| Retain 数据卷 | 保留原卷及其费用，不是独立备份；原卷损坏或误删仍可丢数据。 |
+| EBS 快照 | 独立计费的时间点副本；需停写/一致性方案并实际恢复验证，不含全部系统盘配置、证书或外部依赖。 |
+
+Ghost 发文、Kuma 监控通知、n8n 工作流，以及容器重启、停写复制恢复是本轮本地 Docker 验收范围，
+仍以每份报告中的测试名与结果逐条取证；不追认全部历史版本，更不等于真实 EC2 重启、EBS 恢复或云端 TLS 已验。
 
 ## 3. 字段来源约束（禁止前端猜测）
 
