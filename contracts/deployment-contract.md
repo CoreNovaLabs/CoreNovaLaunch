@@ -210,7 +210,10 @@ Manifest: https://pub-xxxx.r2.dev/candidates/ghost/123456/2/<verification_id>/sc
   官网仅消费已晋级记录；晋级后仍引用原不可变候选资产，按 URL 原路径镜像，不能当临时文件 GC。
 - **精确身份**：传递完整候选引用（app、version、verification_id、verification_run_id、
   verification_run_attempt、key、manifest_sha256），不得按应用名取旧 current 代替。
-  核对同一 Manifest SHA、精确 `tag@digest`、模板 revision 和公开模板内容，检查 CFN 实际模板一致；
+  核对同一 Manifest SHA、精确 `tag@digest`、模板 revision 和公开模板内容，检查 CFN 实际保存的模板
+  与公开字节一致。唯一被容忍的差异是 CFN 存储时的字符级损耗：每个非 ASCII 字符替换为同偏移的 `?`
+  （2026-09-23 对在线栈实测：长度、顺序、缩进与注释均逐字节保留）。非 ASCII 文本本身由 §2.4 的
+  公开对象 SHA 绑定钉扎，不靠这条比对保护；
   证据绑定生产 run/attempt、时间、真实 SSM 会话、完整参数及 `cleanup_confirmed=true`。
 - **核对范围**：始终要求 `stack_created`、`template_match`、`public_access_denied`、`health_external`；
   公网 80/443 拒绝探测不发送凭据，健康检查经实际 SSM 转发。

@@ -286,11 +286,41 @@ def verify_public_template(manifest):
     return body.decode("utf-8")
 
 
-def deployed_template_matches(aws, p):
-    # The public object is mutable and exceeds CFN's 51KB inline limit. Compare
-    # the exact Original template accepted by CFN, closing its URL-fetch race.
+def cfn_expected(published: str) -> str:
+    """The body CloudFormation keeps for these exact bytes.
+
+    Measured 2026-09-23 against a live stack: CFN stores the submitted template verbatim — order,
+    quoting and comments included — and replaces only every non-ASCII character with '?' at the same
+    offset. Our template carries Chinese prose, so without mirroring that single loss `template_match`
+    can never pass, while a naive parse-and-compare would also forgive real drift inside ASCII text.
+    """
+    return published.encode("ascii", "replace").decode("ascii")
+
+
+def _first_diffs(deployed: str, expected: str, limit: int = 3, width: int = 48) -> str:
+    """Name the offsets that disagree, with a narrow window from both sides, so the evidence alone
+    says which bytes drifted. Both inputs are already public template bytes."""
+    hints = [
+        f"@{i} cfn={deployed[i: i + width]!r} published={expected[i: i + width]!r}"
+        for i, (a, b) in enumerate(zip(deployed, expected, strict=False)) if a != b
+    ][:limit]
+    if len(deployed) != len(expected):
+        hints.append(f"length {len(deployed)} vs {len(expected)}")
+    return "; ".join(hints)
+
+
+def deployed_template_diff(aws, p) -> str:
+    """'' means the stack was built from the published bytes; anything else is the reason it was not.
+
+    Non-ASCII identity is the one thing CFN destroys, and it is already pinned one step earlier:
+    `verify_public_template` refused to deploy unless the public object hashed to
+    `config.template_revision` (deployment-contract.md §2.4).
+    """
     body = aws.cfn.get_template(StackName=p.stack_name, TemplateStage="Original")["TemplateBody"]
-    return isinstance(body, str) and body.encode() == p.template_body.encode()
+    if not isinstance(body, str):
+        return f"CFN returned {type(body).__name__}, not template text"
+    expected = cfn_expected(p.template_body)
+    return "" if body == expected else _first_diffs(body, expected)
 
 
 @contextmanager
@@ -728,10 +758,13 @@ def run(
         _create_stack(aws, p)
         ok, detail = _wait_create(aws, p.stack_name)
         report.checks.append(asdict(CheckResult("stack_created", ok, detail)))
-        same = deployed_template_matches(aws, p)
-        report.checks.append(asdict(CheckResult("template_match", same,
-                                               "CFN Original compared with public template SHA")))
-        if ok and same:
+        # A rolled-back stack has no accepted body left to read; asking CFN for one would replace
+        # this precise reason with an opaque GetTemplate error.
+        drift = f"not checked: create failed ({detail})" if not ok else deployed_template_diff(aws, p)
+        report.checks.append(asdict(CheckResult(
+            "template_match", not drift,
+            drift or "CFN Original == published template bytes (ASCII-loss tolerated, §2.4 SHA-pinned)")))
+        if not drift:
             instance = golden.read_canary(aws, p.stack_name)
             report.instance_id, report.public_dns = instance.instance_id, instance.public_dns
             report.checks.append(asdict(public_access_denied(instance.public_dns)))

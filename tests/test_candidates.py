@@ -264,7 +264,7 @@ def test_run_cleanup_is_part_of_green(setup, monkeypatch, cleanup, keep, crash):
     monkeypatch.setattr(prodcheck, "verify_public_template", lambda m: "template")
     monkeypatch.setattr(prodcheck, "_create_stack", lambda *a: None)
     monkeypatch.setattr(prodcheck, "_wait_create", lambda *a: (True, "ok"))
-    monkeypatch.setattr(prodcheck, "deployed_template_matches", lambda *a: True)
+    monkeypatch.setattr(prodcheck, "deployed_template_diff", lambda *a: "")
     monkeypatch.setattr(prodcheck.golden, "read_canary", lambda *a: SimpleNamespace(instance_id="i-1", public_dns="example.com"))
     monkeypatch.setattr(prodcheck.golden, "_wait_for_ssm_ready", lambda *a, **k: None)
     monkeypatch.setattr(prodcheck, "public_access_denied", lambda *a: prodcheck.CheckResult("public_access_denied", True))

@@ -554,11 +554,41 @@ def test_ssm_tunnel_uses_real_document_and_closes_session(monkeypatch):
     assert calls[-1] == {"SessionId": "ssm-session"}
 
 
-def test_cfn_template_fetch_race_fails_closed():
+def _cfn(body):
+    return SimpleNamespace(cfn=SimpleNamespace(get_template=lambda **kw: {"TemplateBody": body}))
+
+
+def _plan(template_body: str) -> ProdPlan:
     p = make_plan({}, [])
-    p.template_body = "expected public bytes"
-    aws = SimpleNamespace(cfn=SimpleNamespace(get_template=lambda **kw: {"TemplateBody": "drifted bytes"}))
-    assert not prodcheck.deployed_template_matches(aws, p)
+    p.template_body = template_body
+    return p
+
+
+def test_cfn_template_fetch_race_fails_closed():
+    drift = prodcheck.deployed_template_diff(_cfn("drifted bytes"), _plan("expected public bytes"))
+    assert drift
+    # The evidence has to name the disagreement: one byte of drift must not need another
+    # billable stack run to diagnose. Both sides here are already-public template bytes.
+    assert "@0" in drift and "expected" in drift and "drifted" in drift
+
+
+def test_cfn_stores_non_ascii_as_question_mark_and_nothing_else_changes():
+    # Measured 2026-09-23 against corenova-network: CFN keeps the submitted body verbatim
+    # (6673 bytes both sides, same order, indent and comments) but writes each non-ASCII
+    # character as '?' at the same offset. Without tolerating exactly that, template_match
+    # can never pass for a template carrying Chinese prose.
+    published = "Description: 契约 §9 — one-click\nResources: {}\n"
+    stored = published.encode("ascii", "replace").decode("ascii")
+    assert prodcheck.deployed_template_diff(_cfn(stored), _plan(published)) == ""
+    # A same-offset swap that CFN *can* see still fails, so the tolerance buys formatting,
+    # not silence: non-ASCII text is pinned by the §2.4 public-object SHA, not by this comparison.
+    assert prodcheck.deployed_template_diff(_cfn(stored.replace("one-click", "one-kl1ck")),
+                                           _plan(published))
+
+
+def test_cfn_body_that_is_not_text_fails_closed():
+    assert prodcheck.deployed_template_diff(_cfn({"AWSTemplateFormatVersion": "2010-09-09"}),
+                                            _plan("x")).startswith("CFN returned dict")
 
 
 def test_abort_record_names_refused_call_without_body():
