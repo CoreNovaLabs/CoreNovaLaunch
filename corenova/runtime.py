@@ -13,6 +13,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .appspec import AppSpec
 from .util import log, run, strip_v
@@ -39,7 +40,12 @@ def build_env(cfg, spec: AppSpec, image_pull_ref: str, image_display_ref: str, w
     # Ghost (and friends) run as a non-root uid inside the image; a bind mount must be
     # writable by it, and the uid is image-defined rather than ours.
     data_dir.chmod(0o777)
+    # Each invocation owns its compose project, including concurrent runs of one app.
+    project = f"cn-{spec.name}-{uuid4().hex[:12]}"
+    compose_file = (cfg.root / spec.g("deploy.compose_file")).resolve()
     values = {
+        "CORENOVA_COMPOSE_PROJECT": project,
+        "CORENOVA_COMPOSE_FILE": str(compose_file),
         "CORENOVA_APP_IMAGE": image_pull_ref,
         "CORENOVA_APP_IMAGE_REF": image_display_ref,
         "CORENOVA_CONTAINER_PORT": str(port),
@@ -47,7 +53,7 @@ def build_env(cfg, spec: AppSpec, image_pull_ref: str, image_display_ref: str, w
         "CORENOVA_APP_URL": f"http://{probe_host}:{hp}",
         "CORENOVA_DATA_DIR": str(data_dir),
     }
-    return Env(values=values, base_url=values["CORENOVA_APP_URL"], project=f"cn-{spec.name}", data_dir=data_dir)
+    return Env(values=values, base_url=values["CORENOVA_APP_URL"], project=project, data_dir=data_dir)
 
 
 def compose(env: Env, spec: AppSpec, root: Path, *args: str, timeout: int = 900) -> str:

@@ -13,7 +13,8 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from corenova import holds, manifest as mf, prodcheck
+from corenova import holds, prodcheck
+from corenova import manifest as mf
 from corenova.appspec import AppSpec
 from corenova.golden import Invocation
 from corenova.prodcheck import CheckCtx, ProdPlan
@@ -106,8 +107,9 @@ def test_plan_admin_auth_branch(tmp_path):
         run_id="1", template_url="https://tpl",
     )
     assert p.parameters["AdminAuthEnabled"] == "true"
-    # 开公网是靠 Basic auth 保护的实证前提（health_external 的 401/200 双探测）
-    assert p.parameters["AllowedWebCidr"] == "0.0.0.0/0"
+    assert p.parameters["AllowedWebCidr"] == "127.0.0.1/32"
+    assert p.parameters["LaunchUrl"] == "http://localhost:8080"
+    assert p.parameters["SelfSignedTls"] == "false"
     assert p.checks == ["health_external", "data_dir_write"]
     assert p.declared == ["admin_auth", "data_dir_write"]
     assert p.parameters["ImageReference"] == f"ghost:6.61.0-alpine@{DIGEST}"
@@ -211,6 +213,7 @@ def admin_ctx(scripts, http_status) -> tuple[CheckCtx, list]:
         plan=plan_, instance_id="i-1", public_dns="ec2-1-2.compute-1.amazonaws.com",
         container="ghost", image_ref=plan_.parameters["ImageReference"], data_path="/data",
         run_script=run_script, http_get=lambda url, headers: (http_status(headers), {}, b""),
+        tunnel_url="http://127.0.0.1:8080", session_id="test-session",
     )
     return ctx, seen_scripts
 
@@ -225,23 +228,23 @@ def test_health_admin_auth_green_and_redacted(fast_poll):
     )
     result = prodcheck.CHECK_FNS["health_external"](ctx)
     assert result.passed, result.detail
-    assert "401" in result.detail and "200" in result.detail
+    assert "SSM port-forward" in result.detail and "200" in result.detail
     assert SECRET not in result.detail  # 密码只许活在内存
     assert SECRET not in ctx.plan.parameters.get("x", "") + result.name
 
 
-def test_health_admin_auth_anon_open_is_fail(fast_poll):
-    # 无凭据直接 200 = Basic auth 门禁失效，绝不能绿灯
-    ctx, _ = admin_ctx(lambda s: inv(f"corenova:{SECRET}\n"), lambda h: 200)
+def test_private_tunnel_loopback_exemption_needs_no_credentials(fast_poll):
+    ctx, scripts = admin_ctx(lambda s: inv(f"corenova:{SECRET}\n"), lambda h: 200)
     result = prodcheck.CHECK_FNS["health_external"](ctx)
-    assert not result.passed
+    assert result.passed
+    assert scripts == []  # authenticated SSM access, no public Basic auth
 
 
 def test_health_admin_auth_missing_credentials_file(fast_poll):
     ctx, _ = admin_ctx(lambda s: inv(code=1, error="No such file"), lambda h: 401)
     result = prodcheck.CHECK_FNS["health_external"](ctx)
     assert not result.passed
-    assert "凭据" in result.detail
+    assert "401" in result.detail
     assert ctx.secret == ""
 
 
@@ -254,17 +257,25 @@ def test_health_loopback_branch(fast_poll):
         seen.append(script)
         return inv("code=200\n")
 
+    urls = []
+    def http_get(url, headers):
+        urls.append(url)
+        return 200, {}, b""
     ctx = CheckCtx(plan=plan_, instance_id="i-1", public_dns="", container="ghost",
-                   image_ref="img", data_path="/data", run_script=run_script)
+                   image_ref="img", data_path="/data", run_script=run_script,
+                   http_get=http_get, tunnel_url="http://127.0.0.1:8080", session_id="test-session")
     result = prodcheck.CHECK_FNS["health_external"](ctx)
     assert result.passed
-    assert "127.0.0.1:80/health" in seen[0]  # 实例内经 nginx 反代的回环探测
+    assert urls == ["http://127.0.0.1:8080/health"]
+    assert seen == []  # instance-side curl is never actual access evidence
 
 
 def test_health_loopback_502_fails(fast_poll):
     plan_ = make_plan({"AdminAuthEnabled": "false", "HealthCheckPath": "/"}, ["health_external"])
     ctx = CheckCtx(plan=plan_, instance_id="i-1", public_dns="", container="ghost",
-                   image_ref="img", data_path="/data", run_script=lambda s: inv("code=502\n"))
+                   image_ref="img", data_path="/data", run_script=lambda s: inv("code=502\n"),
+                   http_get=lambda u, h: (502, {}, b""),
+                   tunnel_url="http://127.0.0.1:8080", session_id="test-session")
     result = prodcheck.CHECK_FNS["health_external"](ctx)
     assert not result.passed and "502" in result.detail
 
@@ -302,8 +313,8 @@ def test_data_dir_write_failure_detail(fast_poll):
 def test_url_injection_trailing_slash_normalized():
     dns = "ec2-1-2.compute-1.amazonaws.com"
     env_out = (
-        f"url=http://{dns}\n"
-        f"PUBLIC_HOOK=http://{dns}/hook\n"  # 注入根 URL 不带斜杠；变量值带 path 也算对
+        "url=http://localhost:8080\n"
+        "PUBLIC_HOOK=http://localhost:8080/hook\n"
         "OTHER=whatever\n"
     )
     ctx = CheckCtx(plan=make_plan({}, ["url_injection"]), instance_id="i", public_dns=dns,
@@ -368,7 +379,7 @@ HOLD_SOURCE = (REPO_ROOT / "tests" / "fixtures" / "held-code-server.yaml").read_
 
 def test_strip_hold_on_real_app_file():
     lines = HOLD_SOURCE.splitlines(keepends=True)
-    hold_i = next(i for i, l in enumerate(lines) if l.rstrip("\n") == "  hold:")
+    hold_i = next(i for i, line in enumerate(lines) if line.rstrip("\n") == "  hold:")
     start = hold_i - 2  # 两行"运维性部署暂停"说明注释
     end = hold_i + 4    # hold: + reason: + en + zh
     assert lines[start].lstrip().startswith("#") and "运维性部署暂停" in lines[start]
@@ -467,3 +478,126 @@ def test_load_manifest_errors_when_unpublished():
         prodcheck.load_manifest(FakeBackend({}), "ghost")
     with pytest.raises(RuntimeError, match="未发布过"):
         prodcheck.load_manifest(FakeBackend({}), "ghost", version="v9.9.9")
+
+
+@pytest.mark.parametrize("url", ["http://public.example/", "https://public.example/",
+                                 "http://127.0.0.1:9999/", "http://127.0.0.1:8080.evil/"])
+def test_credentials_never_leave_established_tunnel(url):
+    ctx, _ = admin_ctx(lambda s: inv(""), lambda h: pytest.fail("HTTP must not be called"))
+    with pytest.raises(ValueError, match="credentials"):
+        prodcheck._http_status(ctx, url, {"Authorization": "Basic secret"})
+
+
+def test_instance_curl_alone_never_counts_as_access(fast_poll):
+    ctx = CheckCtx(plan=make_plan({"HealthCheckPath": "/"}, ["health_external"]),
+                   instance_id="i-1", public_dns="public.example", container="app",
+                   image_ref="app", data_path="/data",
+                   run_script=lambda s: inv("code=200\n"))
+    assert not prodcheck._check_health_external(ctx).passed
+
+
+def test_auth_request_uses_only_ssm_loopback(fast_poll):
+    ctx, _ = admin_ctx(lambda s: inv(f"corenova:{SECRET}\n"), lambda h: 200)
+    seen = []
+    def http_get(url, headers):
+        seen.append((url, headers))
+        return (200 if headers else 401), {}, b""
+    ctx.http_get = http_get
+    assert prodcheck._check_health_external(ctx).passed
+    assert len(seen) == 2
+    assert all(url == "http://127.0.0.1:8080/" for url, _ in seen)
+    assert "Authorization" in seen[-1][1]
+
+
+def test_auth_redirect_not_followed():
+    assert prodcheck._NoRedirect().redirect_request(None, None, 302, "", {}, "http://evil/") is None
+
+
+@pytest.mark.parametrize("open_port", [None, 80, 443])
+def test_public_access_probe_is_credential_free_tcp(monkeypatch, open_port):
+    from contextlib import nullcontext
+    calls = []
+    monkeypatch.setattr(prodcheck.socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("8.8.8.8", 80))])
+    def connect(address, timeout):
+        calls.append(address)
+        if address[1] == open_port:
+            return nullcontext()
+        raise TimeoutError("blocked by security group")
+    monkeypatch.setattr(prodcheck.socket, "create_connection", connect)
+    result = prodcheck.public_access_denied("ec2.example")
+    assert result.passed is (open_port is None)
+    assert calls
+    assert all(len(address) == 2 for address in calls)  # no HTTP/auth payload is sent
+
+
+def test_public_dns_failure_is_not_denial_evidence(monkeypatch):
+    def fail(*a, **k):
+        raise prodcheck.socket.gaierror("DNS failed")
+    monkeypatch.setattr(prodcheck.socket, "getaddrinfo", fail)
+    assert not prodcheck.public_access_denied("missing.example").passed
+
+
+def test_aws_errors_are_not_cleanup_evidence():
+    def denied(**kw):
+        raise RuntimeError("AccessDenied")
+    aws = SimpleNamespace(cfn=SimpleNamespace(describe_stacks=denied),
+                          ec2=SimpleNamespace(describe_instances=denied))
+    with pytest.raises(RuntimeError, match="AccessDenied"):
+        prodcheck._stack_status(aws, "stack")
+    with pytest.raises(RuntimeError, match="AccessDenied"):
+        prodcheck._instance_running(aws, "i-1")
+
+
+def test_ssm_tunnel_uses_real_document_and_closes_session(monkeypatch):
+    from contextlib import nullcontext
+    calls = []
+    class Socket:
+        def bind(self, address):
+            assert address == ("127.0.0.1", 8080)
+    class Process:
+        def poll(self):
+            return None
+        def terminate(self):
+            calls.append("terminate-plugin")
+        def wait(self, timeout):
+            calls.append("wait-plugin")
+    def start(**kw):
+        calls.append(kw)
+        return {"SessionId": "ssm-session", "TokenValue": "secret-token", "StreamUrl": "wss://ssm"}
+    def popen(argv, **kw):
+        assert argv[0] == "session-manager-plugin"
+        assert kw["stdout"] == prodcheck.subprocess.DEVNULL
+        assert kw["stderr"] == prodcheck.subprocess.DEVNULL
+        return Process()
+    monkeypatch.setattr(prodcheck.socket, "socket", lambda: nullcontext(Socket()))
+    monkeypatch.setattr(prodcheck.socket, "create_connection", lambda *a, **k: nullcontext())
+    monkeypatch.setattr(prodcheck.subprocess, "Popen", popen)
+    aws = SimpleNamespace(cfg=SimpleNamespace(region="us-east-1"), ssm=SimpleNamespace(
+        start_session=start, terminate_session=lambda **kw: calls.append(kw)))
+    with prodcheck.ssm_tunnel(aws, "i-123") as (url, session):
+        assert url == "http://127.0.0.1:8080" and session == "ssm-session"
+    assert calls[0]["DocumentName"] == "AWS-StartPortForwardingSession"
+    assert calls[0]["Parameters"] == {"portNumber": ["80"], "localPortNumber": ["8080"]}
+    assert calls[-1] == {"SessionId": "ssm-session"}
+
+
+def test_cfn_template_fetch_race_fails_closed():
+    p = make_plan({}, [])
+    p.template_body = "expected public bytes"
+    aws = SimpleNamespace(cfn=SimpleNamespace(get_template=lambda **kw: {"TemplateBody": "drifted bytes"}))
+    assert not prodcheck.deployed_template_matches(aws, p)
+
+
+def test_volume_delete_must_be_confirmed_and_scoped(fast_poll):
+    calls = []
+    volume = {"VolumeId": "vol-1", "State": "available", "Tags": [
+        {"Key": "corenova:prodcheck", "Value": "true"},
+        {"Key": "corenova:prodcheck-stack", "Value": "our-stack"}]}
+    def describe(**kw):
+        calls.append(kw)
+        return {"Volumes": [volume]}
+    aws = SimpleNamespace(ec2=SimpleNamespace(describe_volumes=describe, delete_volume=lambda **kw: None))
+    notes = []
+    assert not prodcheck._cleanup_volumes(aws, ["vol-1"], notes, "our-stack")
+    assert {"Name": "tag:corenova:prodcheck-stack", "Values": ["our-stack"]} in calls[0]["Filters"]
+    assert any("未确认" in note for note in notes)

@@ -69,6 +69,8 @@ jobs:
     name: verify ${{ inputs.app_name }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    outputs:
+      status: ${{ steps.pipeline.outputs.status }}
     permissions:
       contents: read
       issues: write        # 失败台账 = GitHub issue（state-machine §7），由 pipeline 写/更新
@@ -123,7 +125,9 @@ jobs:
 
       # 契约校验前置：schema 不合法就别浪费一次 docker pull（app-schema §5 十九条）
       - name: Validate app schema
-        run: python scripts/verify/validate_app_schema.py --app "${{ inputs.app_name }}"
+        env:
+          APP_NAME: ${{ inputs.app_name }}
+        run: python scripts/verify/validate_app_schema.py --app "$APP_NAME"
 
       - name: Resolve runtime flags
         id: flags
@@ -149,83 +153,38 @@ jobs:
 
       # 退出码 0=PUBLISHED/VERIFIED，2=FAILED（台账已由 pipeline 写/更新，job 红叉即可）
       - name: Run Application Verification pipeline
+        id: pipeline
         env:
+          APP_NAME: ${{ inputs.app_name }}
           APP_VERSION: ${{ inputs.app_version }}
           HOST_PORT: ${{ inputs.host_port }}
           DRIFT_FLAG: ${{ steps.flags.outputs.drift_flag }}
           FORCE_FLAG: ${{ steps.flags.outputs.force_flag }}
         run: |
           set -euo pipefail
-          ARGS=(--app "${{ inputs.app_name }}")
+          ARGS=(--app "$APP_NAME")
           if [ -n "${APP_VERSION}" ]; then ARGS+=(--version "${APP_VERSION}"); fi
           if [ -n "${HOST_PORT}" ]; then ARGS+=(--host-port "${HOST_PORT}"); fi
           if [ -n "${DRIFT_FLAG}" ]; then ARGS+=("${DRIFT_FLAG}"); fi
           if [ -n "${FORCE_FLAG}" ]; then ARGS+=(--force); fi
           python scripts/verify/run_application_verify.py "${ARGS[@]}"
 
-      # L1.5 chaining（deployment-contract.md §2.6）：验证 + 发布成功后，若本应用声明
-      # 了 production_contract，就向本仓派发 production-check，触发一次性真实栈核对。
-      # 派发只是接力提示——失败绝不把已成功的发布染红，但必须在 step summary 里留痕。
-      - name: Chain L1.5 production check (if declared)
-        if: success()
-        # 发布已成功：这个接力步任何意外都不该把主流程染红（失败仍写进 step summary）。
-        continue-on-error: true
+      # Only the exact reference emitted by this invocation can be dispatched.
+      # CANDIDATE_READY is not PUBLISHED; dispatch failure is visible and stable stays intact.
+      - name: Chain exact candidate production check
+        if: steps.pipeline.outputs.status == 'CANDIDATE_READY'
         env:
           APP_NAME: ${{ inputs.app_name }}
-          GITHUB_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ steps.pipeline.outputs.candidate }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import glob, json, os
-          from corenova import appspec
-          from corenova.config import Config
-          from corenova.gh import github_headers
-          from corenova.util import http_request, log
-
-          cfg = Config.load()
-          app = os.environ["APP_NAME"]
-          summary = os.environ["GITHUB_STEP_SUMMARY"]
-          try:
-              checks = appspec.load(app, cfg.root).g("deployment.production_contract.checks") or []
-          except Exception as exc:  # noqa: BLE001 - 读声明失败只跳过派发，不红主流程
-              checks = []
-              print(f"::warning::读取 production_contract 失败（跳过 L1.5 派发）：{exc}")
-          if not checks:
-              msg = f"{app} 未声明 production_contract → 跳过 L1.5 生产核对派发"
-              log(msg)
-              open(summary, "a").write(f"- {msg}\n")
-              raise SystemExit(0)
-
-          # 本次发布的版本：取 pipeline 刚落盘的最新 state.json
-          version = ""
-          runs = sorted(glob.glob("data/runs/*/state.json"), key=os.path.getmtime)
-          if runs:
-              try:
-                  version = str(json.load(open(runs[-1]))["summary"].get("app_version") or "")
-              except Exception:  # noqa: BLE001 - 版本仅用于精确定位，缺失时交给 current.json
-                  version = ""
-
-          repo = os.environ["GITHUB_REPOSITORY"]
-          payload = {"event_type": "production-check",
-                     "client_payload": {"app": app, "version": version}}
-          ok, status = False, 0
-          try:
-              status, _, body = http_request(
-                  f"https://api.github.com/repos/{repo}/dispatches",
-                  method="POST", headers=github_headers(os.environ["GITHUB_TOKEN"]),
-                  data=payload, timeout=20, retries=2)
-              ok = 200 <= status < 300
-              if not ok:
-                  print(f"::warning::production-check 派发返回 HTTP {status}：{body[:200]!r}")
-          except Exception as exc:  # noqa: BLE001 - 派发异常同样不红主流程
-              print(f"::warning::production-check 派发异常：{exc}")
-          with open(summary, "a") as fh:
-              if ok:
-                  fh.write(f"- L1.5 派发成功：`{app}` @ `{version or '（current）'}` → production-check（checks={checks}）\n")
-              else:
-                  fh.write(f"- L1.5 派发**失败**（HTTP {status or 'error'}），current.json 已发布不受影响，"
-                           f"请手动触发 production-verify.yml\n")
-          PY
+          if [ "$VERIFIED_BACKEND" != "r2" ]; then
+            echo "::error::Production chaining requires shared R2 candidate storage."
+            exit 1
+          fi
+          gh workflow run production-verify.yml --ref main -f "app=$APP_NAME" -f "candidate=$CANDIDATE"
+          echo "Candidate ready and dispatched; stable unchanged until production promotion." >> "$GITHUB_STEP_SUMMARY"
 
       # 容器以自身用户（root/node/git/grafana 等）写 bind mount，runner 用户读不了，
       # 后续诊断与 artifact 上传会 EACCES（gitea /data/ssh 0700 实测）。放开只读位。
@@ -269,7 +228,7 @@ jobs:
   notify-site:
     name: dispatch verified-update → Repo A
     needs: verify
-    if: success()
+    if: needs.verify.outputs.status == 'PUBLISHED'
     uses: ./.github/workflows/publish-site.yml
     with:
       app_name: ""

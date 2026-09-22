@@ -1,4 +1,6 @@
-"""PUBLISHING: two-phase commit per verification-manifest.md §6.
+"""Production-contract apps stage isolated candidates; only production promotes.
+
+Apps without production_contract retain the legacy two-phase publishing path:
 
     P1 placeholder versions/{app_version}.json   (three upload checks = false)
     P2 upload screenshots + report
@@ -6,7 +8,8 @@
     P4 rewrite versions/{app_version}.json      (final state, nine checks truthful)
     P5 commit point: current.json + verified/index.json
 
-Anything failing before P5 leaves the website exactly as it was — that is the gate.
+The legacy path keeps its historical same-version overwrite semantics. The
+production candidate path never writes stable versions, indexes or screenshots.
 """
 
 from __future__ import annotations
@@ -86,6 +89,8 @@ class PublishResult:
     committed_ready: bool = False
     current_written: bool = False
     committed: bool = False
+    candidate_ready: bool = False
+    candidate: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -112,6 +117,20 @@ def publish(
     force: bool = False,
     retries: int = 3,
 ) -> PublishResult:
+    deploy = manifest.get("website", {}).get("deploy", {})
+    # A saved pre-gate manifest must not bypass a newly declared production gate.
+    root = getattr(cfg, "root", None)
+    if root and (Path(root) / "apps" / f"{sanitize_for_id(manifest['app'])}.yaml").is_file():
+        from .appspec import load
+        declared = load(manifest["app"], root).g("deployment.production_contract")
+        if declared is not None and deploy.get("production_contract") != declared:
+            raise ValueError("production contract changed/missing; application re-verification required")
+    if "production_contract" in deploy:
+        import os
+
+        from .candidates import stage
+        return stage(backend, cfg, manifest, screenshots_dir, report_html,
+                     attempt=os.environ.get("GITHUB_RUN_ATTEMPT", "1"))
     app = manifest["app"]
     app_version = manifest["app_version"]
     strategy = str(manifest.get("_strategy") or "release_tag")

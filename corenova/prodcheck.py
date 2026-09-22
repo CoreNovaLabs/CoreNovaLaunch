@@ -1,27 +1,30 @@
-"""L1.5 生产核对（Production Check）— 验证通过后在真实 AWS 一次性栈上实证"可部署"。
+"""L1.5 production gate for one isolated candidate, before stable publication.
 
-填补"验证通过 ≠ 生产可部署"的缺口（deployment-contract.md §2.6）：新版本发布后，
-在与官网深链同源的平台 AMI + 公开模板上为该应用建一次性用户栈，按 apps yaml 声明的
-checks 逐项实测；全部通过即满足规则21 的解除条件，由 production-verify.yml 清 hold。
-
-与 golden.py 同一纪律：实例侧探针只走 SSM、没有 SSH 路径；一次性栈必须删除且清理未
-确认即报错（残留 = 持续计费）；plan() 完全离线可跑（--dry-run 零 AWS 调用）。
-ImageReference 必须 `image@digest` 钉扎——核对的必须恰是刚发布并验证过的那份镜像，
-否则绿灯证明的是另一个字节序列（深链同源性的根）。
+Manifest/image/template bytes are pinned. HTTP originates on the runner through
+an actual SSM port-forward session; public TCP access must be denied. Cleanup is
+part of the success verdict. Manual deployment holds are never cleared here.
+plan() is pure and CLI dry-run requires a local manifest (no backend/AWS lookup).
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
 import shlex
+import socket
+import subprocess
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import golden
 from .appspec import AppSpec
@@ -61,6 +64,7 @@ class ProdPlan:
     declared: list[str]               # apps yaml 声明的原样列表（证据用）
     template_url: str
     tags: list[dict[str, str]] = field(default_factory=list)
+    template_body: str = ""  # exact public bytes, SHA checked before CreateStack
 
 
 @dataclass
@@ -83,7 +87,9 @@ class CheckCtx:
     url_env_names: list[str] = field(default_factory=list)
     secret: str = ""          # 运行期取回的 admin 密码；只在此内存对象中，落盘前脱敏
     run_script: Callable[[str], golden.Invocation] = lambda _s: golden.Invocation()
-    http_get: Callable[[str, dict[str, str]], int] = lambda _u, _h: 0
+    http_get: Callable = lambda _u, _h: (0, {}, b"")
+    tunnel_url: str = ""
+    session_id: str = ""
 
 
 @dataclass
@@ -101,10 +107,22 @@ class ProdCheckReport:
     declared_checks: list[str] = field(default_factory=list)
     checks: list[dict[str, Any]] = field(default_factory=list)
     all_passed: bool = False
+    cleanup_confirmed: bool = False
+    session_id: str = ""
     cleanup: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     started_at: str = field(default_factory=utcnow)
     finished_at: str = ""
+    verification_id: str = ""
+    verification_run_id: str = ""
+    verification_run_attempt: str = ""
+    key: str = ""
+    manifest_sha256: str = ""
+    production_run_id: str = ""
+    production_run_attempt: str = "1"
+    template_revision: str = ""
+    image_reference: str = ""
+    parameters: dict[str, str] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- plan
@@ -191,12 +209,9 @@ def plan(
         # 一次性核对栈绝不能停在"删不掉"的状态：TerminationProtection=Enabled 会让
         # delete-stack 失败——显式 Disable 保证清理步任何时候都能终止实例。
         "TerminationProtection": "Disabled",
-        # AllowedWebCidr 两分支（简单方案）：声明 admin_auth 的应用开 0.0.0.0/0，
-        # Basic auth 是第二道门——health_external 的"无凭据 401/带凭据 200"正是这道门
-        # 的实证；未声明 admin_auth 的应用（code-server、vikunja）以 127.0.0.1/32 对
-        # 公网关闭，健康探测改经 SSM 在实例内 curl 127.0.0.1——docker run→nginx 反代→
-        # 应用应答全链路仍被覆盖，缺的只是"公网→SG→nginx"一跳，不为核对引入隧道编排。
-        "AllowedWebCidr": "0.0.0.0/0" if admin_auth else "127.0.0.1/32",
+        "LaunchUrl": "http://localhost:8080",
+        "AllowedWebCidr": "127.0.0.1/32",
+        "SelfSignedTls": "false",
         "AdminAuthEnabled": "true" if admin_auth else "false",
         "HostMetricsAccess": "true" if host_metrics else "false",
     }
@@ -214,8 +229,10 @@ def plan(
         checks=checks,
         declared=declared,
         template_url=template_url if template_url is not None
-        else public_template_url(cfg.template_bucket, cfg.template_s3_region),
-        tags=[STACK_TAG, BILLING_TAG, {"Key": "corenova:purpose", "Value": "production-check"}],
+        else (deploy.get("template") or {}).get("url")
+        or public_template_url(cfg.template_bucket, cfg.template_s3_region),
+        tags=[STACK_TAG, BILLING_TAG, {"Key": "corenova:purpose", "Value": "production-check"},
+              {"Key": "corenova:prodcheck-stack", "Value": stack}],
     )
 
 
@@ -230,12 +247,117 @@ def _redact(ctx: CheckCtx, text: str) -> str:
 
 
 def _http_status(ctx: CheckCtx, url: str, headers: dict[str, str]) -> int:
+    parsed = urlsplit(url)
+    if headers and (not ctx.session_id or parsed.hostname != "127.0.0.1"
+                    or not url.startswith(ctx.tunnel_url + "/")):
+        raise ValueError("credentials may only use the established SSM tunnel")
     try:
         status, _, _ = ctx.http_get(url, headers)
         return int(status)
-    except Exception as exc:  # noqa: BLE001 - 探测异常按未就绪计，交给轮询收敛
-        log(f"http 探测异常（重试中）：{type(exc).__name__}: {exc}")
+    except Exception as exc:  # noqa: BLE001 - fail closed; never log auth-bearing errors
+        log(f"http probe failed: {type(exc).__name__}")
         return 0
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def tunnel_http_get(url, headers):
+    if urlsplit(url).hostname != "127.0.0.1":
+        raise ValueError("SSM HTTP target must be loopback")
+    # No proxies, no redirects (including auth-bearing redirects to the public web).
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with opener.open(req, timeout=20) as response:
+            return response.status, dict(response.headers), response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, {}, b""
+
+
+def verify_public_template(manifest):
+    from .candidates import template_identity
+    url, revision = template_identity(manifest)
+    status, _, body = http_request(url, timeout=30, retries=0)
+    if status != 200 or hashlib.sha256(body).hexdigest()[:40] != revision:
+        raise ValueError("public template SHA drift; deployment refused")
+    return body.decode("utf-8")
+
+
+def deployed_template_matches(aws, p):
+    # The public object is mutable and exceeds CFN's 51KB inline limit. Compare
+    # the exact Original template accepted by CFN, closing its URL-fetch race.
+    body = aws.cfn.get_template(StackName=p.stack_name, TemplateStage="Original")["TemplateBody"]
+    return isinstance(body, str) and body.encode() == p.template_body.encode()
+
+
+@contextmanager
+def ssm_tunnel(aws, instance_id):
+    # LaunchUrl and real runner port agree; refuse an occupied local port.
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 8080))
+    request = {"Target": instance_id, "DocumentName": "AWS-StartPortForwardingSession",
+               "Parameters": {"portNumber": ["80"], "localPortNumber": ["8080"]}}
+    response = aws.ssm.start_session(**request)
+    session_id = response["SessionId"]
+    process = None
+    try:
+        process = subprocess.Popen(
+            ["session-manager-plugin", json.dumps(response), aws.cfg.region, "StartSession", "",
+             json.dumps(request), f"https://ssm.{aws.cfg.region}.amazonaws.com"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+        def ready():
+            if process.poll() is not None:
+                raise RuntimeError("SSM port forwarding plugin exited")
+            try:
+                with socket.create_connection(("127.0.0.1", 8080), timeout=1):
+                    return True
+            except OSError:
+                return None
+
+        if poll_until(ready, timeout_s=60, interval_s=1) is not True:
+            raise RuntimeError("SSM port forwarding did not become ready")
+        yield "http://127.0.0.1:8080", session_id
+        if process.poll() is not None:
+            raise RuntimeError("SSM port forwarding exited during checks")
+    finally:
+        try:
+            if process is not None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
+        finally:
+            aws.ssm.terminate_session(SessionId=session_id)
+
+
+def public_access_denied(public_dns):
+    if not public_dns:
+        return CheckResult("public_access_denied", False, "missing public endpoint")
+    try:
+        # Successful DNS resolution is required; DNS errors aren't ACL evidence.
+        addresses = socket.getaddrinfo(public_dns, 80, type=socket.SOCK_STREAM)
+        if not addresses:
+            raise ValueError("no public address")
+        for address in {item[4][0] for item in addresses}:
+            import ipaddress
+            if not ipaddress.ip_address(address).is_global:
+                raise ValueError("not a public address")
+            for port in (80, 443):
+                try:
+                    with socket.create_connection((address, port), timeout=5):
+                        return CheckResult("public_access_denied", False, f"public TCP/{port} reachable")
+                except (TimeoutError, ConnectionRefusedError):
+                    pass
+        return CheckResult("public_access_denied", True, "runner public TCP/80,443 denied; zero credentials sent")
+    except (OSError, ValueError) as exc:
+        return CheckResult("public_access_denied", False, f"public probe inconclusive: {type(exc).__name__}")
 
 
 def _fetch_admin_credentials(ctx: CheckCtx) -> bool:
@@ -250,54 +372,29 @@ def _fetch_admin_credentials(ctx: CheckCtx) -> bool:
 
 
 def _check_health_external(ctx: CheckCtx) -> CheckResult:
-    if ctx.plan.parameters.get("AdminAuthEnabled") == "true":
-        return _health_with_admin_auth(ctx)
-    return _health_via_loopback(ctx)
+    """Runner HTTP through an actual SSM session; never instance-side curl evidence."""
+    if not ctx.session_id or ctx.tunnel_url != "http://127.0.0.1:8080":
+        return CheckResult("health_external", False, "actual SSM port-forward session required")
+    path = ctx.plan.parameters.get("HealthCheckPath", "/")
+    if not path.startswith("/") or path.startswith("//"):
+        return CheckResult("health_external", False, "invalid health path")
+    url = ctx.tunnel_url + path
+    seen = {"code": 0}
 
-
-def _health_with_admin_auth(ctx: CheckCtx) -> CheckResult:
-    """外部真实路径：无凭据必须 401（门有效），带凭据必须 2xx/3xx（应用活着）。
-    任一条不满足都不能解除 hold——401 消失意味着保护失效。"""
-    if not _fetch_admin_credentials(ctx):
-        return CheckResult("health_external", False, "SSM 读取管理凭据失败（admin.txt 不存在或为空？）")
-    token = base64.b64encode(f"{ADMIN_USER}:{ctx.secret}".encode()).decode()
-    url = f"http://{ctx.public_dns}{ctx.plan.parameters.get('HealthCheckPath', '/')}"
-    seen = {"anon": 0, "authed": 0}
-
-    def probe() -> bool | None:
-        seen["anon"] = _http_status(ctx, url, {})
-        seen["authed"] = _http_status(ctx, url, {"Authorization": f"Basic {token}"})
-        return True if (seen["anon"] == 401 and 200 <= seen["authed"] < 400) else None
+    def probe():
+        seen["code"] = _http_status(ctx, url, {})
+        # Loopback exemption is intentional for private SSM access. Only obtain
+        # Basic credentials if the private endpoint actually challenges us.
+        if seen["code"] == 401 and ctx.plan.parameters.get("AdminAuthEnabled") == "true":
+            if not ctx.secret and not _fetch_admin_credentials(ctx):
+                return None
+            token = base64.b64encode(f"{ADMIN_USER}:{ctx.secret}".encode()).decode()
+            seen["code"] = _http_status(ctx, url, {"Authorization": f"Basic {token}"})
+        return True if 200 <= seen["code"] < 300 else None
 
     ok = poll_until(probe, timeout_s=HEALTH_POLL_TIMEOUT_S, interval_s=HEALTH_POLL_INTERVAL_S) is True
-    detail = (
-        f"外部无凭据={seen['anon']} 带凭据={seen['authed']}"
-        f"（预期 401/2xx；本机 127.0.0.1 经 geo 空 realm 免认证不在此路径）"
-    )
-    return CheckResult("health_external", bool(ok), _redact(ctx, detail))
-
-
-def _health_via_loopback(ctx: CheckCtx) -> CheckResult:
-    """AllowedWebCidr=127.0.0.1/32 的分支：公网打不进来是设计使然，探针经 SSM 在
-    实例内 curl 127.0.0.1——同一 nginx 反代路径，只差公网一跳（原因见 plan() 注释）。"""
-    path = ctx.plan.parameters.get("HealthCheckPath", "/")
-    seen = {"code": "000"}
-
-    def probe() -> str | None:
-        inv = ctx.run_script(
-            "curl -s -o /dev/null -w 'code=%{http_code}\\n' --max-time 15 "
-            f"http://127.0.0.1:80{shlex.quote(path)}"
-        )
-        m = re.search(r"code=(\d{3})", inv.out)
-        if m and 200 <= int(m.group(1)) < 400:
-            return m.group(1)
-        seen["code"] = m.group(1) if m else "000"
-        return None
-
-    code = poll_until(probe, timeout_s=HEALTH_POLL_TIMEOUT_S, interval_s=HEALTH_POLL_INTERVAL_S)
-    ok = code is not None
-    return CheckResult("health_external", bool(ok), _redact(
-        ctx, f"实例内经 :80 反代 HTTP={code or seen['code']}（入口对公网关闭，非缺陷）"))
+    return CheckResult("health_external", ok,
+                       f"runner -> SSM port-forward -> nginx HTTP={seen['code']}; credentials confined to tunnel")
 
 
 def _check_data_dir_write(ctx: CheckCtx) -> CheckResult:
@@ -322,12 +419,9 @@ def _check_data_dir_write(ctx: CheckCtx) -> CheckResult:
 
 
 def _check_url_injection(ctx: CheckCtx) -> CheckResult:
-    """URL 注入是"部署后应用自报地址对不对"的根（Ghost/vikunja 类应用配错公网
-    URL 会把所有绝对链接指向 localhost），必须在容器 env 里以实例公网 DNS 实证。"""
+    """Verify application URL injection matches the website's private LaunchUrl."""
     if not ctx.url_env_names:
         return CheckResult("url_injection", False, "应用未声明任何接收 URL 的环境变量，无从核对")
-    if not ctx.public_dns:
-        return CheckResult("url_injection", False, "实例没有公网 DNS，无法断言注入值")
     inv = ctx.run_script(f"docker exec {shlex.quote(ctx.container)} env")
     if inv.exit_code != 0:
         return CheckResult("url_injection", False, _redact(ctx, f"docker exec env 失败：{inv.out[:200]} {inv.error[:200]}"))
@@ -336,18 +430,18 @@ def _check_url_injection(ctx: CheckCtx) -> CheckResult:
         key, _, value = line.partition("=")
         if key:
             actual[key] = value
-    want = f"http://{ctx.public_dns}"
+    want = ctx.plan.parameters.get("LaunchUrl", "http://localhost:8080")
     bad: list[str] = []
     for name in ctx.url_env_names:
         value = actual.get(name, "")
         # 注入的根 URL 不带斜杠；应用配置可能约定带斜杠或在其后接路径
         # （如 PUBLIC_HOOK=${CORENOVA_APP_URL}/hook）。故以"根地址为前缀"实证，
-        # 尾斜杠归一，但绝不允许指向 localhost/别的 host。
+        # 尾斜杠归一，但绝不允许偏离 LaunchUrl。
         root = value.rstrip("/")
         if not (root == want or root.startswith(want + "/")):
             bad.append(f"{name}={value[:120]!r}")
     ok = not bad
-    detail = "全部 URL 变量以实例公网地址为值：" + ",".join(ctx.url_env_names) if ok \
+    detail = "全部 URL 变量与私有 LaunchUrl 一致：" + ",".join(ctx.url_env_names) if ok \
         else "不符：" + "; ".join(bad)
     return CheckResult("url_injection", ok, _redact(ctx, detail))
 
@@ -388,8 +482,10 @@ def run_checks(ctx: CheckCtx) -> list[CheckResult]:
 def _stack_status(aws: golden.Aws, stack_name: str) -> str:
     try:
         return aws.cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["StackStatus"]
-    except Exception:  # noqa: BLE001 - CFN 对不存在的栈抛 ValidationError
-        return ""
+    except Exception as exc:
+        if "does not exist" in str(exc):
+            return ""
+        raise  # AccessDenied/network failure is NOT proof of deletion
 
 
 def _wait_create(aws: golden.Aws, stack_name: str) -> tuple[bool, str]:
@@ -438,7 +534,7 @@ def _create_stack(aws: golden.Aws, p: ProdPlan) -> None:
     )
 
 
-def _cleanup_volumes(aws: golden.Aws, captured: list[str], notes: list[str]) -> bool:
+def _cleanup_volumes(aws: golden.Aws, captured: list[str], notes: list[str], stack_name: str) -> bool:
     """删栈后按 tag 扫残留 EBS 并删除。
 
     模板数据卷 DeleteOnTermination=false（对用户是特性，对一次性栈是计费泄漏），
@@ -460,7 +556,7 @@ def _cleanup_volumes(aws: golden.Aws, captured: list[str], notes: list[str]) -> 
     try:
         listed = aws.ec2.describe_volumes(Filters=[
             {"Name": "tag:corenova:prodcheck", "Values": ["true"]},
-            {"Name": "status", "Values": ["available"]},
+            {"Name": "tag:corenova:prodcheck-stack", "Values": [stack_name]},
         ]).get("Volumes", [])
         targets += [v["VolumeId"] for v in listed if v.get("VolumeId")]
     except Exception as exc:  # noqa: BLE001 - 扫描是保险，失败不推翻逐项删除
@@ -474,7 +570,8 @@ def _cleanup_volumes(aws: golden.Aws, captured: list[str], notes: list[str]) -> 
                 continue
             tags = {str(t.get("Key")): str(t.get("Value")) for t in volume.get("Tags") or []}
             # 只删自己创建的卷：captured 里出现无标签卷说明传播假设破了，宁可留人工。
-            if tags.get("corenova:prodcheck") != "true":
+            if (tags.get("corenova:prodcheck") != "true"
+                    or tags.get("corenova:prodcheck-stack") != stack_name):
                 clean = False
                 notes.append(f"数据卷 {volume_id} 缺少 prodcheck 标签，拒绝删除")
                 continue
@@ -483,7 +580,12 @@ def _cleanup_volumes(aws: golden.Aws, captured: list[str], notes: list[str]) -> 
                 notes.append(f"数据卷 {volume_id} 状态 {volume.get('State')}，无法删除，必须人工处理")
                 continue
             aws.ec2.delete_volume(VolumeId=volume_id)
-            notes.append(f"数据卷 {volume_id} 已删除")
+            if poll_until(lambda vid=volume_id: True if describe(vid) is None else None,
+                          timeout_s=120, interval_s=5) is not True:
+                clean = False
+                notes.append(f"数据卷 {volume_id} 删除未确认")
+            else:
+                notes.append(f"数据卷 {volume_id} 已确认删除")
         except Exception as exc:  # noqa: BLE001
             clean = False
             notes.append(f"数据卷 {volume_id} 删除失败：{type(exc).__name__}: {exc}")
@@ -513,7 +615,7 @@ def destroy_stack(aws: golden.Aws, p: ProdPlan, instance) -> tuple[bool, list[st
         notes.append(f"栈 {p.stack_name} 未在时限内删净（残留=持续计费）")
     instance_id = getattr(instance, "instance_id", "")
     volume_ids = list(getattr(instance, "volume_ids", []) or [])
-    volumes_clean = _cleanup_volumes(aws, volume_ids, notes)
+    volumes_clean = _cleanup_volumes(aws, volume_ids, notes, p.stack_name)
     if instance_id and _instance_running(aws, instance_id):
         notes.append(f"实例 {instance_id} 仍在运行 —— 必须人工终止")
         return False, notes
@@ -523,9 +625,11 @@ def destroy_stack(aws: golden.Aws, p: ProdPlan, instance) -> tuple[bool, list[st
 def _instance_running(aws: golden.Aws, instance_id: str) -> bool:
     try:
         res = aws.ec2.describe_instances(InstanceIds=[instance_id])["Reservations"][0]["Instances"][0]
-    except Exception:  # noqa: BLE001 - 栈删净后实例必然消失，查询失败按已消失处理，卷扫描兜底
-        return False
-    return (res.get("State") or {}).get("Name", "") in ("pending", "running", "stopping")
+    except Exception as exc:
+        if "InvalidInstanceID.NotFound" in str(exc):
+            return False
+        raise
+    return (res.get("State") or {}).get("Name", "") != "terminated"
 
 
 # --------------------------------------------------------------------------- evidence
@@ -542,7 +646,7 @@ def summary_markdown(report: ProdCheckReport) -> str:
         "",
         f"- 应用/版本：`{report.app}` @ `{report.app_version}`",
         f"- 一次性栈：`{report.stack_name}`（region={report.region}）",
-        f"- 结论：**{'全部通过，可解除部署暂停' if report.all_passed else '未通过，hold 保持不变'}**",
+        f"- 结论：**{'核对及清理通过，等待受保护 promotion；人工 hold 保留' if report.all_passed else '未通过，stable/hold 保持不变'}**",
         "",
         "| 核对项 | 结果 | 实测 |",
         "| --- | --- | --- |",
@@ -597,84 +701,74 @@ def run(
     aws: golden.Aws,
     *,
     keep: bool = False,
+    candidate_ref: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """建一次性栈 → 逐项核对 → finally 删栈收卷。返回可序列化的核对报告。"""
-    # 一次性栈用公开 one-click 合并模板：网络自包含，无前置 network 栈依赖（plan() 注释）。
-    p = plan(
-        cfg, spec, manifest,
-        run_id=os.environ.get("GITHUB_RUN_ID") or time.strftime("%H%M%S", time.gmtime()),
-    )
-    report = ProdCheckReport(
-        app=p.parameters["AppName"],
-        app_version=str(manifest.get("app_version") or ""),
-        run_id=p.stack_name.rsplit("-", 1)[-1],
-        stack_name=p.stack_name,
-        template_url=p.template_url,
-        region=cfg.region,
-        declared_checks=list(p.declared),
-    )
-    current_raw = backend.get(f"verified/{sanitize_for_id(report.app)}/current.json")
-    if current_raw:
-        published = str(json.loads(current_raw).get("app_version") or "")
-        if published and published != report.app_version:
-            report.notes.append(f"核对版本 {report.app_version} 不是当前发布版本 {published}（结果只对该版本生效）")
+    """Check one exact candidate; cleanup is part of the success gate."""
+    from . import candidates
+    from .util import file_sha
 
+    if not candidate_ref:
+        raise ValueError("exact candidate reference required; latest/stable is not accepted")
+    envelope, stored = candidates.load(backend, candidate_ref)
+    if candidates.digest(manifest) != candidates.digest(stored):
+        raise ValueError("supplied manifest differs from candidate")
+    candidates.assert_fresh(backend, envelope, manifest)
+    if file_sha(spec.path) != manifest.get("config", {}).get("app_config_revision"):
+        raise ValueError("app contract/hold changed since verification")
+    production_run = os.environ.get("GITHUB_RUN_ID") or str(time.time_ns())
+    p = plan(cfg, spec, manifest, run_id=production_run)
+    report = ProdCheckReport(
+        **candidate_ref, run_id=production_run, production_run_id=production_run,
+        production_run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT", "1"),
+        stack_name=p.stack_name, template_url=p.template_url, region=cfg.region,
+        declared_checks=list(p.declared), parameters=p.parameters,
+        template_revision=candidates.template_identity(manifest)[1],
+        image_reference=p.parameters["ImageReference"],
+    )
     instance = golden.Canary(stack_name=p.stack_name)
-    deployed = False
+    attempted = False
     try:
-        try:
-            _create_stack(aws, p)
-            deployed = True
-        except Exception as exc:  # noqa: BLE001 - 建栈请求本身失败也要留下 stack_created 证据
-            report.checks.append(
-                asdict(CheckResult("stack_created", False, f"{type(exc).__name__}: {exc}"[:600]))
-            )
-            report.cleanup.append("建栈请求未成功，无栈可清理")
-            report.all_passed = False
-            return asdict(report) | {"plan": {"parameters": p.parameters, "checks": p.checks}}
+        p.template_body = verify_public_template(manifest)
+        attempted = True  # even a timed-out create request may have created resources
+        _create_stack(aws, p)
         ok, detail = _wait_create(aws, p.stack_name)
         report.checks.append(asdict(CheckResult("stack_created", ok, detail)))
-        if ok:
-            # CREATE_COMPLETE 已含 cfn-signal（WaitCondition），实例与容器就绪；
-            # 探针通道仍需单独确认可达（SSM agent 晚于 signal 注册实测发生过）。
+        same = deployed_template_matches(aws, p)
+        report.checks.append(asdict(CheckResult("template_match", same,
+                                               "CFN Original compared with public template SHA")))
+        if ok and same:
             instance = golden.read_canary(aws, p.stack_name)
             report.instance_id, report.public_dns = instance.instance_id, instance.public_dns
-            try:
-                golden._wait_for_ssm_ready(aws, instance.instance_id, timeout_minutes=SSM_READY_TIMEOUT_MINUTES)
-            except Exception as exc:  # noqa: BLE001
-                report.checks.extend(
-                    asdict(CheckResult(name, False, f"SSM 通道不可达：{type(exc).__name__}"))
-                    for name in p.checks
-                )
-            else:
+            report.checks.append(asdict(public_access_denied(instance.public_dns)))
+            golden._wait_for_ssm_ready(aws, instance.instance_id, timeout_minutes=SSM_READY_TIMEOUT_MINUTES)
+            with ssm_tunnel(aws, instance.instance_id) as (url, session_id):
+                report.session_id = session_id
                 ctx = CheckCtx(
-                    plan=p,
-                    instance_id=instance.instance_id,
-                    public_dns=instance.public_dns,
-                    container=p.parameters["AppName"],
-                    image_ref=p.parameters["ImageReference"],
+                    plan=p, instance_id=instance.instance_id, public_dns=instance.public_dns,
+                    container=p.parameters["AppName"], image_ref=p.parameters["ImageReference"],
                     data_path=p.parameters["DataContainerPath"],
                     url_env_names=url_env_names_from(manifest),
                     run_script=lambda script: golden.ssm_run(aws, instance.instance_id, script),
-                    http_get=lambda url, headers: http_request(url, headers=headers, timeout=20, retries=0),
+                    http_get=tunnel_http_get, tunnel_url=url, session_id=session_id,
                 )
                 report.checks.extend(asdict(r) for r in run_checks(ctx))
+    except Exception as exc:  # noqa: BLE001 - preserve failure evidence and always cleanup
+        # Avoid exception bodies from clients that might include session tokens.
+        report.notes.append(f"production check aborted: {type(exc).__name__}")
+        report.checks.append(asdict(CheckResult("execution", False, type(exc).__name__)))
     finally:
-        if deployed and not keep:
-            gone, notes = destroy_stack(aws, p, instance)
-            report.cleanup += notes
-            for note in notes:
-                log(f"清理：{note}")
-            if not gone:
-                report.notes.append("核对栈清理未确认 —— 残留资源持续计费，必须人工处理")
-        elif deployed:
-            report.cleanup.append(f"keep-stack → 保留 {p.stack_name}（栈内资源在计费，调试完手动 delete-stack 并删数据卷）")
-        report.all_passed = bool(report.checks) and all(c["passed"] for c in report.checks)
+        if attempted and not keep:
+            try:
+                report.cleanup_confirmed, notes = destroy_stack(aws, p, instance)
+                report.cleanup += notes
+            except Exception as exc:  # noqa: BLE001 - unknown cleanup state must stay red
+                report.cleanup.append(f"cleanup unconfirmed: {type(exc).__name__}")
+        elif attempted:
+            report.cleanup.append(f"keep-stack: {p.stack_name}; promotion forbidden")
+        expected = {"stack_created", "template_match", "public_access_denied", *p.checks}
+        report.all_passed = (report.cleanup_confirmed and bool(report.session_id)
+                             and {c["name"] for c in report.checks} == expected
+                             and all(c["passed"] is True for c in report.checks))
         report.finished_at = utcnow()
         _emit_report(cfg, report)
-
-    return asdict(report) | {"plan": {"parameters": p.parameters, "checks": p.checks}}
-
-# hold 的解除（deployment.hold 行级手术）在 corenova/holds.py：strip_hold /
-# strip_hold_file 是 hold 生命周期唯一归属。production-verify.yml 核对全绿后调用，
-# 保留注释与键序、结构异常拒绝盲删。
+    return asdict(report)

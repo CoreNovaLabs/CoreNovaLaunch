@@ -201,10 +201,15 @@ def run_verification(
         })
         _write_state(cfg, vid, manifest, summary)
         return summary
-    summary["checks"] = manifest["checks"]
+    summary["checks"] = result.checks
     summary["notes"] = result.notes
     summary["verification_id"] = manifest["verification_id"]
-    summary["status"] = "PUBLISHED" if result.current_written else "FAILED"
+    summary["candidate"] = result.candidate
+    summary["status"] = ("CANDIDATE_READY" if result.candidate_ready else
+                         "PUBLISHED" if result.current_written else "FAILED")
+    if result.candidate_ready:
+        _write_state(cfg, vid, manifest, summary)
+        return summary
     if result.current_written:
         # state-machine §7：发布成功即关闭该版本的历史失败台账
         resolve_failures(app, resolved.app_version, manifest["verification_id"])
@@ -359,7 +364,12 @@ def main() -> None:
         die(str(exc))
 
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    if summary["status"] not in ("PUBLISHED", "VERIFIED"):
+    # Exact current invocation output, never infer a dispatch target from mtime/latest.
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+            fh.write(f"status={summary['status']}\n")
+            fh.write("candidate=" + json.dumps(summary.get("candidate", {}), separators=(",", ":")) + "\n")
+    if summary["status"] not in ("PUBLISHED", "VERIFIED", "CANDIDATE_READY"):
         raise SystemExit(2)
 
 

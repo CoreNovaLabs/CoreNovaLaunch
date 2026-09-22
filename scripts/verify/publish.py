@@ -129,31 +129,22 @@ def main(argv: list[str] | None = None) -> int:
         log(str(exc))
         return 3
 
-    backend = make_backend(cfg)
-    current_before = publish.current_version(app, cfg)
-
     if args.dry_run:
-        ok, why = publish.may_update_current(
-            backend, app, str(manifest["app_version"]), str(manifest.get("verification_run_id") or "0"),
-            str(manifest.get("_strategy") or "release_tag"), args.force,
-        )
         out = {
-            "status": "DRY_RUN",
-            "backend": backend.name,
-            "app": app,
-            "app_version": manifest["app_version"],
+            "status": "DRY_RUN", "app": app, "app_version": manifest["app_version"],
             "verification_id": manifest["verification_id"],
-            "current_published_before": current_before,
-            "would_commit_current": ok,
-            "why": why,
+            "would_commit_current": False if manifest["website"].get("deploy", {}).get("production_contract") else None,
+            "notes": ["offline only; no backend/current lookup; freshness is checked at actual publish"],
             "missing_local_artifacts": [] if shots_dir.is_dir() else [str(shots_dir)],
-            "notes": ["--dry-run：未写任何对象"],
         }
         print(json.dumps(out, ensure_ascii=False, indent=2))
-        return 0 if ok else 1
+        return 0
 
+    backend = make_backend(cfg)
+    current_before = publish.current_version(app, cfg)
     result = publish.publish(backend, cfg, manifest, shots_dir, report_html, force=args.force)
-    status = "PUBLISHED" if result.current_written else ("NOT_COMMITTED" if result.committed_ready else "FAILED")
+    status = ("CANDIDATE_READY" if result.candidate_ready else "PUBLISHED" if result.current_written
+              else "NOT_COMMITTED" if result.committed_ready else "FAILED")
     out = {
         "status": status,
         "backend": backend.name,
@@ -163,11 +154,15 @@ def main(argv: list[str] | None = None) -> int:
         "current_published_before": current_before,
         "current_published_after": publish.current_version(app, cfg),
         "committed_ready": result.committed_ready,
-        "checks_all_true": all(manifest["checks"].get(c) for c in CHECKS),
-        "checks": manifest["checks"],
+        "checks_all_true": all(result.checks.get(c) for c in CHECKS),
+        "checks": result.checks,
+        "candidate": result.candidate,
         "notes": result.notes,
-        "published_at": utcnow(),
+        "published_at": utcnow() if result.current_written else "",
     }
+    if result.candidate_ready:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0  # no site dispatch until exact production promotion
     if result.current_written:
         if args.dispatch:
             # 复用 pipeline 的实现，避免 dispatch payload 出现第二套形状
