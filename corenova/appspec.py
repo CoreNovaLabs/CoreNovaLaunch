@@ -361,6 +361,12 @@ def validate(spec: AppSpec, root: Path, platform_region: str) -> list[str]:
         elif re.search(r"[\s;&|`$]", dp):
             e.append(f"规则19: deployment.data_path 含非法字符（空格或 shell 元字符）：{dp!r}")
 
+    e.extend(validate_persistence(spec))
+    if g("deployment.persistence") == "none" and compose_rel:
+        compose = root / compose_rel
+        if compose.is_file():
+            e.extend(_validate_stateless_compose(compose.read_text(encoding="utf-8")))
+
     # 20 应用原生 URL 环境变量名；值由模板按 LaunchUrl / PublicDnsName 生成。
     app_url_env_name = g("deployment.app_url_env_name")
     if app_url_env_name is not None and (
@@ -438,6 +444,50 @@ def validate(spec: AppSpec, root: Path, platform_region: str) -> list[str]:
         e.append("规则: website.featured 必填 boolean")
     if not g("website.tags"):
         e.append("规则: website.tags 非空必填")
+    return e
+
+
+def validate_persistence(spec: AppSpec) -> list[str]:
+    """Missing persistence is not evidence of a stateless deployment."""
+    deployment = spec.g("deployment") or {}
+    if "persistence" not in deployment:
+        return []
+    mode = spec.g("deployment.persistence")
+    if mode not in ("none", "volume"):
+        return [f"deployment.persistence 必须为 none/volume，实为 {mode!r}"]
+    e: list[str] = []
+    if mode == "volume":
+        if not spec.g("deployment.data_path"):
+            e.append("persistence=volume 必须声明非空 deployment.data_path")
+        return e
+    if spec.app_type != "stateless_web":
+        e.append("persistence=none 仅允许 app_type=stateless_web")
+    if "data_path" in deployment:
+        e.append("persistence=none 禁止声明 deployment.data_path（包括空值）")
+    for section in (spec.data, spec.g("deploy") or {}, deployment):
+        if "volumes" in section:
+            e.append("persistence=none 禁止 volumes 声明")
+    checks = spec.g("deployment.production_contract.checks") or []
+    if isinstance(checks, list) and "data_dir_write" in checks:
+        e.append("persistence=none 禁止 data_dir_write production check")
+    return e
+
+
+def _validate_stateless_compose(text: str) -> list[str]:
+    try:
+        compose = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        return [f"persistence=none 无法核对 compose volumes：{exc}"]
+    if not isinstance(compose, dict) or not isinstance(compose.get("services"), dict):
+        return ["persistence=none 要求 compose.services 为映射以核对 volumes"]
+    e: list[str] = []
+    if "volumes" in compose:
+        e.append("persistence=none 禁止 compose 顶层 volumes 声明")
+    for name, service in compose["services"].items():
+        if not isinstance(service, dict):
+            e.append(f"persistence=none 无法核对 compose service {name!r} 的 volumes")
+        elif service.get("volumes") or service.get("volumes_from"):
+            e.append(f"persistence=none 禁止 compose service {name!r} 挂载 volumes/volumes_from")
     return e
 
 

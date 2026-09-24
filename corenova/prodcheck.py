@@ -27,7 +27,7 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from . import golden
-from .appspec import AppSpec
+from .appspec import AppSpec, validate_persistence
 from .config import Config
 from .template_publish import public_template_url
 from .util import http_request, log, poll_until, sanitize_for_id, utcnow, write_json
@@ -185,6 +185,26 @@ def plan(
         raise ValueError("deployment.production_contract.checks 为空：无声明的应用不该进入生产核对")
 
     deploy = manifest.get("website", {}).get("deploy") or {}
+    persistence_errors = validate_persistence(spec)
+    if persistence_errors:
+        raise ValueError("; ".join(persistence_errors))
+    persistence = deploy.get("persistence", "volume")
+    if persistence not in ("none", "volume"):
+        raise ValueError("website.deploy.persistence 必须为 none/volume")
+    if persistence != spec.g("deployment.persistence", "volume"):
+        raise ValueError("persistence 声明与 Manifest 投影不一致")
+    if persistence == "none":
+        projected_checks = (deploy.get("production_contract") or {}).get("checks") or []
+        if ("data_path" in deploy or "volumes" in deploy
+                or type(deploy.get("data_volume_gb")) is not int
+                or deploy["data_volume_gb"] != 0
+                or "data_dir_write" in projected_checks):
+            raise ValueError("persistence=none 要求 data_volume_gb=0，禁止 data_path/volumes/data_dir_write")
+    elif "persistence" in deploy:
+        path = deploy.get("data_path")
+        if (not isinstance(path, str) or not path.startswith("/")
+                or re.search(r"[\s;&|`$]", path)):
+            raise ValueError("persistence=volume 必须投影有效 data_path")
     platform = manifest.get("platform") or {}
     ami_id = str(platform.get("ami_id") or "")
     if not ami_id.startswith("ami-"):
@@ -202,8 +222,8 @@ def plan(
         "ContainerPort": str(deploy["container_port"]),
         "AmiId": ami_id,
         "InstanceType": str(deploy["instance_type"]),
-        "DataVolumeSize": str(deploy["data_volume_gb"]),
-        "DataContainerPath": str(deploy.get("data_path") or "/data"),
+        "DataVolumeSize": "0" if persistence == "none" else str(deploy["data_volume_gb"]),
+        "DataContainerPath": "" if persistence == "none" else str(deploy.get("data_path") or "/data"),
         "HealthCheckPath": str(deploy.get("health_check_path") or "/"),
         "CloudWatchLogGroupName": f"/corenova/prodcheck/{stack}",
         # 一次性核对栈绝不能停在"删不掉"的状态：TerminationProtection=Enabled 会让
@@ -215,6 +235,8 @@ def plan(
         "AdminAuthEnabled": "true" if admin_auth else "false",
         "HostMetricsAccess": "true" if host_metrics else "false",
     }
+    if "persistence" in deploy:
+        params["PersistenceMode"] = persistence
     if deploy.get("app_url_env_name"):
         params["AppUrlEnvironmentName"] = str(deploy["app_url_env_name"])
     extra_env = deploy.get("extra_environment") or []

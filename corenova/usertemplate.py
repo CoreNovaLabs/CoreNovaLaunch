@@ -31,9 +31,12 @@ def build(root: Path) -> dict:
     app = yaml.safe_load((fixed / "app.yaml").read_text(encoding="utf-8"))
 
     conditions: dict = {}
+    rules: dict = {}
     for src in (net, app):
         for k, v in (src.get("Conditions") or {}).items():
             conditions[k] = copy.deepcopy(v)
+        for k, v in (src.get("Rules") or {}).items():
+            rules[k] = copy.deepcopy(v)
     resources: dict = {}
     for name, spec in net["Resources"].items():
         resources[name] = copy.deepcopy(spec)
@@ -87,6 +90,7 @@ def build(root: Path) -> dict:
             "passed verification. Docs: https://corenova-website.pages.dev/docs/verification"
         ),
         "Parameters": parameters,
+        "Rules": rules,
         "Conditions": conditions,
         "Resources": resources,
         "Outputs": outputs,

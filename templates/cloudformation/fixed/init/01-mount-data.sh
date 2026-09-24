@@ -2,6 +2,21 @@
 # Identify the requested EBS mapping before any filesystem operation; never guess disk order.
 set +x
 set -euo pipefail
+case "${CFNOVA_PERSISTENCE-volume}" in
+  none)
+    [ "${CFNOVA_DATA_VOLUME_SIZE-0}" = 0 ] && [ -z "${CFNOVA_DATA_CONTAINER_PATH-}" ] || {
+      echo '[corenova] none requires size 0 and an empty container data path' >&2; exit 1;
+    }
+    # No Python, IMDS, device discovery, directory creation or mount in stateless mode.
+    exit 0 ;;
+  volume)
+    SIZE="${CFNOVA_DATA_VOLUME_SIZE-30}"
+    [[ "$SIZE" =~ ^[1-9][0-9]{0,3}$ ]] && (( SIZE >= 8 && SIZE <= 4096 )) &&
+      [ -n "${CFNOVA_DATA_CONTAINER_PATH-/data}" ] || {
+        echo '[corenova] volume requires integer size 8..4096 and a container data path' >&2; exit 1;
+      } ;;
+  *) echo '[corenova] invalid persistence mode' >&2; exit 1 ;;
+esac
 python3 - "${CFNOVA_DATA_DIR:?}" <<'PY'
 import datetime, hashlib, hmac, json, os, pathlib, re, stat, subprocess, sys, time
 import urllib.error, urllib.parse, urllib.request, xml.etree.ElementTree

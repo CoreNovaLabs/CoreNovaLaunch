@@ -41,7 +41,13 @@ flock -n 9 || fail 'another HTTPS transition is running'
 # private deployment out of HTTPS after any reboot. The root-disk marker says the asset chain
 # finished once; the mount/service/readiness checks below are what actually gate this transition.
 [ -f /opt/corenova/etc/bootstrap-complete ] || fail 'bootstrap has not completed'
-mountpoint -q "${CFNOVA_DATA_DIR:?}" || fail 'data volume is not mounted'
+case "${CFNOVA_PERSISTENCE-volume}" in
+  none)
+    [ "${CFNOVA_DATA_VOLUME_SIZE-0}" = 0 ] && [ -z "${CFNOVA_DATA_CONTAINER_PATH-}" ] ||
+      fail 'none requires size 0 and an empty container data path' ;;
+  volume) mountpoint -q "${CFNOVA_DATA_DIR:?}" || fail 'data volume is not mounted' ;;
+  *) fail 'invalid persistence mode' ;;
+esac
 systemctl is-active --quiet "corenova-${CFNOVA_APP_NAME:?}" || fail 'application is not running'
 CODE="$(curl -sS --connect-timeout 3 --max-time 15 -o /dev/null -w '%{http_code}' "http://127.0.0.1${CFNOVA_HEALTH_PATH:-/}")"
 case "$CODE" in 2??|3??) ;; *) fail 'private application readiness check failed' ;; esac

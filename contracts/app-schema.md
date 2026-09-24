@@ -117,6 +117,7 @@ deployment:                           # required, 网站展示用的静态部署
     note:                             # optional, Localized；估算口径（实例档/磁盘/区域），建议注明"以实际账单为准"
       en: "Verified default: ~$15.2 t3.small + $4 for 50 GB gp3 + $3.65 public IPv4 per month."
       zh: "已验证默认配置：t3.small 约 $15.2 + 50GB gp3 约 $4 + 公网 IPv4 约 $3.65/月。"
+  persistence: volume                # optional, volume | none；none 显式声明无应用数据盘（规则19）
   data_path: "/var/lib/ghost/content" # optional, string；容器内数据挂载目录（与 compose 文件的容器目标一致），
                                       # 是 CFN DataContainerPath 参数的真相源；必须以 / 开头（§5 规则19）
   app_url_env_name: "url"             # optional, string；接收应用访问 URL 的原生环境变量名
@@ -186,7 +187,8 @@ website:                              # required
 | `deployment.post_deploy.notes[]` | ❌ | Localized[] | `[]` | 每项 `en` 与 `zh` 都必须非空 |
 | `deployment.cost_estimate.monthly_usd` | 条件必填 | number | — | `cost_estimate` 存在时必填且 > 0；按需价格估算至少覆盖实例 + 全部 EBS + 公网 IPv4 |
 | `deployment.cost_estimate.note` | ❌ | Localized | `null` | 估算口径说明；若存在 `en`/`zh` 均非空；含敏感词即校验失败 |
-| `deployment.data_path` | stateful_app 必填 | string | `null` | 容器内数据挂载目录，必须以 `/` 开头；与 compose 文件容器目标一致，是 CFN `DataContainerPath` 的真相源 |
+| `deployment.persistence` | ❌ | `volume` / `none` | 未声明 | `none` 显式声明不创建应用数据盘、不挂载应用数据目录；只允许无挂载的 `stateless_web`，缺少 `data_path` 本身不代表 `none` |
+| `deployment.data_path` | stateful_app 或显式 volume 必填 | string | `null` | 容器内数据挂载目录，必须以 `/` 开头；与 compose 文件容器目标一致，是 CFN `DataContainerPath` 的真相源；`none` 时禁止声明 |
 | `deployment.app_url_env_name` | ❌ | string | `null` | 接收公开访问 URL 的应用原生环境变量名；必须匹配 `^[A-Za-z_][A-Za-z0-9_]*$` |
 | `deployment.production_contract.checks` | ❌ | string[] | `null` | L1.5 生产核对声明；非空、去重，每项 ∈ {`admin_auth`,`data_dir_write`,`url_injection`,`host_metrics`}（规则22） |
 | `release_type_override` | ❌ | enum | `null` | 非空时必须带 `# reason:`（deployment-contract.md §4.1） |
@@ -290,7 +292,7 @@ health_check:
 16. `deploy.extra_environment` 每项必须匹配 `^[A-Za-z_][A-Za-z0-9_]*=.+$`（KEY=VALUE）；KEY 或 VALUE 含 `secret`/`password`/`token`/`private_key`（不区分大小写）即校验失败——敏感值走 SSM Parameter Store / Secrets，不进 app schema（§7 单容器边界同理）。
 17. `deployment.post_deploy` 若存在：必须是映射；`admin_path` 若存在必须以 `/` 开头；`admin_path` 存在时 `admin_setup` 的 `en`/`zh` 均必须非空（有后台入口就必须说明怎么进去）；`notes[]` 每项 `en`/`zh` 均非空；所有文案含 `secret`/`password`/`token`/`private_key`（不区分大小写）即校验失败——凭据不进契约，只允许写"去哪获取"。
 18. `deployment.cost_estimate` 若存在：必须是映射；`monthly_usd` 必须为正数（写了 `cost_estimate` 就必须给出可信数字）；`note` 若存在 `en`/`zh` 均非空，且含 `secret`/`password`/`token`/`private_key`（不区分大小写）即校验失败——价格与口径是注册时人工核对的事实，前端只展示、绝不按实例规格自行计算。
-19. `stateful_app` 必须声明 `deployment.data_path`；其他类型若声明也必须为以 `/` 开头的字符串；含空格或 shell 元字符（`;&|`$`）则校验失败。该值必须与应用 compose 文件的容器挂载目标一致——它是 CFN `DataContainerPath` 参数的唯一真相源，compose / CFN / extra_environment 三处不得各自硬编码导致漂移。
+19. `stateful_app` 或显式 `deployment.persistence: volume` 必须声明 `deployment.data_path`；其他类型若声明也必须为以 `/` 开头的字符串；含空格或 shell 元字符（`;&|`$`）则校验失败。该值必须与应用 compose 文件的容器挂载目标一致——它是 CFN `DataContainerPath` 参数的唯一真相源，compose / CFN / extra_environment 三处不得各自硬编码导致漂移。`deployment.persistence` 若声明只允许 `volume` 或 `none`；`none` 只允许 `stateless_web`，禁止声明 `data_path`、Compose 卷挂载和 `data_dir_write` 核对项。缺少数据路径不得推断为 `none`。`none` 投影为 `deploy.persistence: none`、`deploy.data_volume_gb: 0`，省略 `deploy.data_path`；不创建应用数据 EBS、不挂载数据目录，但实例系统盘及其他平台资源仍存在并计费。
 20. `deployment.app_url_env_name` 若存在，必须匹配 `^[A-Za-z_][A-Za-z0-9_]*$`。它只声明应用原生变量名；变量值由 CloudFormation 在启动时根据显式 `LaunchUrl` 或实例 `PublicDnsName` 生成，禁止 app schema、前端或模板写死部署地址。
 21. `deployment.hold` 若存在：必须是映射且仅含 `reason` 键；`reason` 的 `en`/`zh` 均非空，且含 `secret`/`password`/`token`/`private_key`（不区分大小写）即校验失败。hold 是**运维性部署暂停**，独立于验证结果（`status: verified` 的应用也可能被 hold）；声明后投影进 `current.json` 的 `deploy.hold`，官网以此拦截全部部署入口。发布与解除走 `scripts/verify/sync_holds.py`（条件写，不动 versions/、index 与任何验证字段），不等下一次验证——否则“hold 拦住验证 → hold 字段永远进不了发布数据”死锁。
 22. `deployment.production_contract` 若存在：必须是映射且仅含 `checks` 键；`checks` 为非空、无重复的 string[]，每项 ∈ {`admin_auth`, `data_dir_write`, `url_injection`, `host_metrics`}。它声明 L1.5 **发布前**生产门禁（deployment-contract.md §2.6）：先把 Manifest、报告、截图隔离到 `candidates/{app}/{run}/{attempt}/{verification_id}/`，`CANDIDATE_READY` 不是发布；`production-verify.yml` 核对同 Manifest SHA、digest、模板 revision/CFN 实际模板、私有 SSM 参数及清理确认后，才 CAS current 并更新版本与索引。24 小时新鲜度、latest 候选意图/run/attempt、app config hash 与 current etag 均须通过；任一失败不晋级。**人工 hold 永不自动清除**，须人工重新核对后移除 yaml 再 sync_holds。核对项同时决定深链模板参数（`admin_auth`→`AdminAuthEnabled`、`host_metrics`→`HostMetricsAccess`），投影为 `deploy.production_contract.checks`；默认 `LaunchUrl=http://localhost:8080`、`AllowedWebCidr=127.0.0.1/32`、`SelfSignedTls=false`。无该声明仍走旧 P1–P5，不能宣称有生产验收。`checks` 含 `data_dir_write` 时必须声明 `deployment.data_path`（规则19）；含 `url_injection` 时须有 `deployment.app_url_env_name`（规则20）或含 `${CORENOVA_APP_URL}` 的 `deploy.extra_environment`，否则校验失败。

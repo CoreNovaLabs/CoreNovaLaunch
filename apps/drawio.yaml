@@ -43,6 +43,7 @@ tests:
       en: draw.io
       zh: draw.io 流程图
 deployment:
+  persistence: none
   size: small
   documentation_url: https://github.com/jgraph/docker-drawio
   regions:

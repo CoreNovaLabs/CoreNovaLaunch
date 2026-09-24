@@ -42,6 +42,7 @@ tests:
       en: CyberChef
       zh: CyberChef 数据处理
 deployment:
+  persistence: none
   size: small
   documentation_url: https://github.com/gchq/CyberChef/wiki
   regions:

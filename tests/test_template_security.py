@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -108,6 +109,121 @@ def test_golden_exception_requires_identity_and_no_credentials(tmp_path, overrid
     assert not (tmp_path / "nginx/conf.d/corenova-proxy.conf").exists()
 
 
+def run_isolated_persistence_asset(tmp_path, asset, overrides):
+    """Run the whole shipped Bash with a closed PATH, temp paths and no host/network tools."""
+    for name in ("bin", "opt/bin", "systemd"):
+        (tmp_path / name).mkdir(parents=True, exist_ok=True)
+    for name in (asset, "05-access-policy.sh"):
+        text = (INIT / name).read_text()
+        for old, new in (("/opt/corenova", "opt"), ("/etc/systemd/system", "systemd"),
+                         ("/var/lib/corenova/app/data", "data")):
+            text = text.replace(old, str(tmp_path / new))
+        (tmp_path / "opt/bin" / name).write_text(text)
+    # Only harmless filesystem utilities can run for real, against rewritten temp paths.
+    for name in ("cat", "mkdir", "chmod", "seq"):
+        (tmp_path / "bin" / name).symlink_to(shutil.which(name))
+    fake = r'''#!/bin/bash
+name="${0##*/}"
+printf '%s %s\n' "$name" "$*" >> "$MOCK_LOG"
+case "$name" in
+  python3)
+    # The mount Python is tested separately with fake devices/IMDS. This sentinel proves
+    # the whole shell selected volume without letting it touch any real disk or metadata.
+    [ "$ASSET" != 01-mount-data.sh ] || exit 73
+    exec "$PYTHON" -c 'import socket,sys; socket.socket=lambda *a,**k: sys.exit("network forbidden"); sys.argv=sys.argv[1:]; exec(sys.stdin.read())' "$@" ;;
+  docker)
+    case "$1" in
+      pull|ps) ;;
+      image) [ "$CFNOVA_PERSISTENCE" = volume ] || exit 97; printf '1000:1000\n' ;;
+      *) exit 97 ;;
+    esac ;;
+  mountpoint) [ "$CFNOVA_PERSISTENCE" = volume ] && [ "$MOUNT_RC" = 0 ] ;;
+  find) [ "$CFNOVA_PERSISTENCE" = volume ] || exit 97 ;;
+  chown) [ "$CFNOVA_PERSISTENCE" = volume ] ;;
+  systemctl) if [ "$1" = is-active ]; then printf 'active\n'; fi ;;
+  *) exit 97 ;;
+esac
+'''
+    for name in ("python3", "docker", "mountpoint", "find", "chown", "systemctl", "stat",
+                 "install", "mount", "umount", "lsblk", "blkid", "wipefs", "mkfs.ext4",
+                 "udevadm", "nvme", "findmnt", "curl", "sleep"):
+        path = tmp_path / "bin" / name
+        path.write_text(fake)
+        path.chmod(0o755)
+    env = {
+        "PATH": str(tmp_path / "bin"), "PYTHON": sys.executable, "ASSET": asset,
+        "MOCK_LOG": str(tmp_path / "commands.log"), "MOUNT_RC": "0",
+        "ENV_FILE": str(tmp_path / "opt/env/demo.env"),
+        "CFNOVA_APP_NAME": "demo", "CFNOVA_IMAGE_REFERENCE": "example/demo@sha256:abc",
+        "CFNOVA_CONTAINER_PORT": "8080", "CFNOVA_APP_URL": "http://localhost:8080",
+        "CFNOVA_PERSISTENCE": "volume", "CFNOVA_DATA_DIR": str(tmp_path / "data"),
+    } | overrides
+    proc = subprocess.run(["/bin/bash", str(tmp_path / "opt/bin" / asset)], env=env,
+                          capture_output=True, text=True, timeout=10)
+    log = tmp_path / "commands.log"
+    return proc, log.read_text().splitlines() if log.exists() else []
+
+
+@pytest.mark.parametrize("asset", ["01-mount-data.sh", "30-app-container.sh"])
+def test_stateless_whole_scripts_never_touch_data_or_probe_image_user(tmp_path, asset):
+    proc, calls = run_isolated_persistence_asset(tmp_path, asset, {
+        "CFNOVA_PERSISTENCE": "none", "CFNOVA_DATA_VOLUME_SIZE": "0",
+        "CFNOVA_DATA_CONTAINER_PATH": "", "MOUNT_RC": "1",
+    })
+    assert proc.returncode == 0, proc.stderr
+    assert not (tmp_path / "data").exists()
+    if asset == "01-mount-data.sh":
+        assert calls == []  # Not even Python/IMDS is reached.
+    else:
+        assert {line.split()[0] for line in calls} <= {"python3", "docker", "systemctl"}
+        assert (tmp_path / "opt/env/demo.env").stat().st_mode & 0o777 == 0o600
+        assert all(not line.startswith(("docker image", "docker run")) for line in calls)
+        unit = (tmp_path / "systemd/corenova-demo.service").read_text()
+        assert "RequiresMountsFor" not in unit and "mountpoint" not in unit
+        assert " -v " not in unit and "--mount" not in unit
+        assert str(tmp_path / "data") not in unit
+        assert "CORENOVA_DATA_DIR" not in (tmp_path / "opt/env/demo.env").read_text()
+        assert "ExecStart=/usr/bin/docker run" in unit
+
+
+@pytest.mark.parametrize("asset", ["01-mount-data.sh", "30-app-container.sh"])
+@pytest.mark.parametrize("override", [
+    {"CFNOVA_PERSISTENCE": "unknown"}, {"CFNOVA_PERSISTENCE": ""},
+    {"CFNOVA_PERSISTENCE": "none", "CFNOVA_DATA_VOLUME_SIZE": "8"},
+    {"CFNOVA_PERSISTENCE": "none", "CFNOVA_DATA_CONTAINER_PATH": "/data"},
+    {"CFNOVA_DATA_CONTAINER_PATH": ""},
+    *[{"CFNOVA_DATA_VOLUME_SIZE": size} for size in ("0", "1", "7", "7.5", "8.5", "4097", "-1", "bad")],
+])
+def test_bad_persistence_fails_before_external_commands(tmp_path, asset, override):
+    proc, calls = run_isolated_persistence_asset(tmp_path, asset, override)
+    assert proc.returncode != 0
+    assert calls == []
+    assert not (tmp_path / "data").exists()
+    assert not (tmp_path / "systemd/corenova-demo.service").exists()
+
+
+@pytest.mark.parametrize("size", ["8", "30", "4096"])
+def test_volume_shell_still_enters_safe_device_verification(tmp_path, size):
+    proc, calls = run_isolated_persistence_asset(tmp_path, "01-mount-data.sh", {
+        "CFNOVA_DATA_VOLUME_SIZE": size, "CFNOVA_DATA_CONTAINER_PATH": "/custom",
+    })
+    assert proc.returncode == 73  # Isolated Python sentinel, not a disk operation.
+    assert calls == [f"python3 - {tmp_path}/data"]
+
+
+def test_volume_isolated_renderer_retains_mount_and_owner_checks(tmp_path):
+    (tmp_path / "data").mkdir()
+    proc, calls = run_isolated_persistence_asset(tmp_path, "30-app-container.sh", {})
+    assert proc.returncode == 0, proc.stderr
+    assert f"mountpoint -q {tmp_path}/data" in calls
+    assert f"chown 1000:1000 {tmp_path}/data" in calls
+    unit = (tmp_path / "systemd/corenova-demo.service").read_text()
+    assert f"RequiresMountsFor={tmp_path}/data" in unit
+    assert f"ExecStartPre=/usr/bin/mountpoint -q {tmp_path}/data" in unit
+    assert f"-v {tmp_path}/data:/data" in unit
+    assert f"CORENOVA_DATA_DIR={tmp_path}/data" in (tmp_path / "opt/env/demo.env").read_text()
+
+
 def test_mount_protection_precedes_docker_and_survives_reboots(tmp_path):
     proc = render_asset(tmp_path, "30-app-container.sh", {"MOCK_MOUNT_RC": "1"})
     assert proc.returncode != 0
@@ -120,7 +236,7 @@ def test_mount_protection_precedes_docker_and_survives_reboots(tmp_path):
     assert unit.index("/usr/bin/mountpoint") < unit.index("/usr/bin/docker")
 
 
-def run_https_asset(tmp_path, asset="enable-https.sh", args=None, failure="", dns="8.8.8.8", initialized=True):
+def run_https_asset(tmp_path, asset="enable-https.sh", args=None, failure="", dns="8.8.8.8", initialized=True, init_overrides=None):
     """No real certbot/curl/systemctl runs; all paths including the dummy secrets live in tmp_path."""
     for directory in ("opt/bin", "opt/etc", "nginx/conf.d", "nginx/snippets", "nginx/tls", "logs", "run", "logrotate", "letsencrypt/live/example.com"):
         (tmp_path / directory).mkdir(parents=True, exist_ok=True)
@@ -172,11 +288,11 @@ esac
     # Native rendering is tested with the real renderer separately; here record transition order/rollback.
     (tmp_path / "opt/bin/30-app-container.sh").write_text("#!/bin/bash\nexec app-render\n")
     init_env = tmp_path / "opt/etc/init.env"
-    init_env.write_text("\n".join(f"export {k}={shlex.quote(v)}" for k, v in {
+    init_env.write_text("\n".join(f"export {k}={shlex.quote(v)}" for k, v in ({
         "CFNOVA_APP_NAME": "demo", "CFNOVA_APP_URL": "http://localhost:8080",
         "CFNOVA_ALLOWED_WEB_CIDR": "127.0.0.1/32", "CFNOVA_SELF_SIGNED_TLS": "false",
         "CFNOVA_CONTAINER_PORT": "8080", "CFNOVA_DATA_DIR": str(tmp_path / "data"),
-    }.items()) + "\n")
+    } | (init_overrides or {})).items()) + "\n")
     # No /run/corenova-cfn-init.rc here on purpose: /run is tmpfs and user-data does not re-run on
     # stop/start, so every case below also proves the post-reboot state can still enable HTTPS.
     (tmp_path / "opt/etc/bootstrap-complete").write_text("completed_at=2026-09-22T00:00:00Z\n")
@@ -225,9 +341,28 @@ def test_initialization_and_dns_are_checked_before_acme(tmp_path, options):
     assert (tmp_path / "nginx/conf.d/corenova-proxy.conf").read_text() == "private-config\n"
 
 
+@pytest.mark.parametrize("overrides", [
+    {"CFNOVA_PERSISTENCE": "unknown"}, {"CFNOVA_PERSISTENCE": ""},
+    {"CFNOVA_PERSISTENCE": "none", "CFNOVA_DATA_VOLUME_SIZE": "8"},
+    {"CFNOVA_PERSISTENCE": "none", "CFNOVA_DATA_CONTAINER_PATH": "/data"},
+    {"CFNOVA_PERSISTENCE": "volume"},
+])
+def test_https_invalid_persistence_or_unmounted_volume_blocks_acme(tmp_path, overrides):
+    proc = run_https_asset(tmp_path, failure="mount", init_overrides=overrides)
+    assert proc.returncode != 0
+    calls = (tmp_path / "commands.log").read_text()
+    assert "certbot " not in calls and "curl " not in calls
+    assert ("mountpoint " in calls) == (overrides["CFNOVA_PERSISTENCE"] == "volume")
+    assert (tmp_path / "nginx/conf.d/corenova-proxy.conf").read_text() == "private-config\n"
+
+
+@pytest.mark.parametrize("persistence", ["volume", "none"])
 @pytest.mark.parametrize("failure", ["acme", "certificate", "nginx", "app"])
-def test_failed_https_transition_restores_private_state(tmp_path, failure):
-    proc = run_https_asset(tmp_path, failure=failure)
+def test_failed_https_transition_restores_private_state(tmp_path, failure, persistence):
+    proc = run_https_asset(tmp_path, failure=failure, init_overrides={
+        "CFNOVA_PERSISTENCE": persistence, "CFNOVA_DATA_VOLUME_SIZE": "0" if persistence == "none" else "30",
+        "CFNOVA_DATA_CONTAINER_PATH": "" if persistence == "none" else "/data",
+    })
     assert proc.returncode != 0, proc.stdout + proc.stderr
     assert not (tmp_path / "opt/etc/https.env").exists()
     assert (tmp_path / "nginx/conf.d/corenova-proxy.conf").read_text() == "private-config\n"
@@ -236,9 +371,16 @@ def test_failed_https_transition_restores_private_state(tmp_path, failure):
     assert "systemctl restart nginx" in (tmp_path / "commands.log").read_text()
 
 
-def test_https_success_keeps_auth_and_redirects_remote_http_before_proxy(tmp_path):
-    proc = run_https_asset(tmp_path)
+@pytest.mark.parametrize("persistence", [None, "volume", "none"])
+def test_https_success_keeps_auth_and_redirects_remote_http_before_proxy(tmp_path, persistence):
+    overrides = {} if persistence is None else {
+        "CFNOVA_PERSISTENCE": persistence, "CFNOVA_DATA_VOLUME_SIZE": "0" if persistence == "none" else "30",
+        "CFNOVA_DATA_CONTAINER_PATH": "" if persistence == "none" else "/data",
+    }
+    proc = run_https_asset(tmp_path, init_overrides=overrides, failure="mount" if persistence == "none" else "")
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    calls = (tmp_path / "commands.log").read_text()
+    assert ("mountpoint " not in calls) == (persistence == "none")
     state = (tmp_path / "opt/etc/https.env").read_text()
     assert "CFNOVA_APP_URL='https://example.com'" in state
     assert "CFNOVA_ADMIN_AUTH=true" in state

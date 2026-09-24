@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 from corenova import usertemplate
@@ -22,14 +24,16 @@ def test_template_revision_is_a_40_hex_content_sha():
     assert re.fullmatch(r"[0-9a-f]{40}", rev), f"revision 形状非法: {rev!r}"
 
 
-def test_revision_matches_the_published_template_artifact():
-    # build_user_template.py 落盘的发布物（S3 put 的同一份文本）；
-    # 引导期尚未生成时跳过（CI publish-template 会先落盘再发布）。
-    artifact = REPO_ROOT / "data" / "templates" / "corenova-one-click.template.yaml"
-    if not artifact.exists():
-        return  # pragma: no cover - 无发布物的环境
+def test_revision_matches_the_published_template_artifact(tmp_path):
+    # 用真实发布构建器在临时目录落盘，始终验证本次源码，不依赖本地残留产物。
+    artifact = tmp_path / "corenova-one-click.template.yaml"
+    proc = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts/verify/build_user_template.py"),
+         "--out", str(artifact)], cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
     assert file_sha(artifact) == usertemplate.revision(REPO_ROOT), (
-        "data/templates 发布物与 usertemplate.revision 不一致："
+        "发布构建器产物与 usertemplate.revision 不一致："
         "验证证据绑定的模板与用户实际部署的模板会漂移，检查合并实现是否分叉"
     )
 

@@ -82,6 +82,9 @@ def build(
     verified_at = verified_at or utcnow()
     vid = vid or verification_id(spec.name, resolved.app_version)
     instance_type, data_volume_gb = spec.resources()
+    persistence = spec.g("deployment.persistence")
+    if persistence == "none":
+        data_volume_gb = 0  # 无数据卷不改变实例尺寸阶梯或资源地板校验
     region = str(platform.get("region") or cfg.region)
 
     # 模板-证据绑定（deployment-contract.md §2.4）：记录验证时用户模板的内容 SHA。
@@ -166,9 +169,13 @@ def build(
     if isinstance(cost, dict) and cost:
         website["deploy"]["cost_estimate"] = cost
 
-    # 容器内数据路径（app-schema.md 规则19）：注册了才投影，前端用于部署后指引
+    # 只投影显式声明；旧应用缺少 data_path 不等于无状态。
+    if persistence in ("none", "volume"):
+        website["deploy"]["persistence"] = persistence
+
+    # 容器内数据路径（app-schema.md 规则19）：none 不投影挂载目录。
     dp = spec.g("deployment.data_path")
-    if isinstance(dp, str) and dp:
+    if persistence != "none" and isinstance(dp, str) and dp:
         website["deploy"]["data_path"] = dp
 
     # CloudFormation 在实例启动后才知道 PublicDnsName；应用只声明接收该地址的

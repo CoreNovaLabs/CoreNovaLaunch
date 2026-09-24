@@ -6,6 +6,7 @@ what we verify is byte-for-byte what the Manifest records.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 import urllib.error
@@ -69,6 +70,14 @@ def compose(env: Env, spec: AppSpec, root: Path, *args: str, timeout: int = 900)
 
 def up(env: Env, spec: AppSpec, root: Path) -> str:
     out = compose(env, spec, root, "up", "-d", "--quiet-pull", timeout=1800)
+    if spec.g("deployment.persistence") == "none":
+        cid = container_id(env, spec, root)
+        if not cid:
+            raise RuntimeError("persistence=none 的应用容器不存在")
+        mounts = run(["docker", "inspect", "--format", "{{json .Mounts}}", cid], timeout=60)
+        # 镜像自身的 VOLUME 也会创建挂载，不能只检查 Compose 声明。
+        if json.loads(mounts.stdout) != []:
+            raise RuntimeError("persistence=none 的应用容器存在挂载，拒绝生成无状态证据")
     log("compose up 完成")
     return out
 

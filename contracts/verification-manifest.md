@@ -226,6 +226,7 @@
 | `platform.base_ami_source` | Platform Contract | 每次验证变 | `public` \| `custom`（公开 AMI 引导期 vs 自建/收费 AMI 期），见 platform-contract.md §2.1 |
 | `config.tests_revision` | `apps/{app}/tests/**` 的 git SHA（未提交回退内容哈希） | 测试变更时变 | 钉住产生本次 `tests_passed` 的测试版本，见 §4.3 |
 | `config.template_revision` / `website.deploy.template.revision` | one-click 模板合并输出的内容 SHA（未提交回退内容哈希） | 模板源变更时变 | 钉住产生本次证据的部署模板版本，对账 `deploy.template`，见 deployment-contract.md §2.4 |
+| `website.deploy.persistence` | app schema `deployment.persistence` 显式投影 | 声明变更时变 | `none` 对应 `data_volume_gb: 0` 且省略 `data_path`；无应用数据盘，不表示无系统盘或零费用。缺字段不能推断为 `none`；旧记录须重验，不补写历史证据 |
 | `website.deploy.production_contract` | app schema `deployment.production_contract` 投影（`{"checks": [...]}`） | 声明变更时变 | 发布前候选生产门禁与深链参数声明，不自动解除人工 hold；见 deployment-contract.md §2.6，无声明省略键 |
 | `verification_run_attempt` / `website.verification_run_attempt` | 候选 stage 的 Actions run attempt（字符串） | 每次 attempt 变 | 本轮候选新增投影；与 run_id 一起排序/隔离，旧路径可缺省（§6.4） |
 | `website.deploy.hold` | app schema `deployment.hold` 投影 | 运维态，**非证据** | 只随 `current.json` 发布；发布器写 `versions/<version>.json` 时剥离（不可变证据不冻结运维态），消费口径见 deployment-contract.md §2.5 |

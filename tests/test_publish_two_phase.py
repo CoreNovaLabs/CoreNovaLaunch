@@ -410,6 +410,53 @@ def test_deploy_runtime_contract_is_projected(tmp_path):
     assert deploy["app_url_env_name"] == "url"
 
 
+@pytest.mark.parametrize("size", ["small", "medium", "large", "xlarge"])
+def test_none_projects_zero_volume_without_changing_instance_size(tmp_path, size):
+    from tests.test_schema_rules import STATELESS_COMPOSE, stateless
+
+    make_spec, resolved, image, platform, outcome = _build_inputs(tmp_path)
+    spec = make_spec(tmp_path, stateless, STATELESS_COMPOSE)
+    spec.data["deployment"]["size"] = size
+    expected_instance, original_disk = spec.resources()
+    m = mf.build(spec, tmp_path, resolved, image, platform, outcome, Cfg(), "local-none")
+    deploy = m["website"]["deploy"]
+    assert deploy["persistence"] == "none"
+    assert deploy["data_volume_gb"] == 0
+    assert "data_path" not in deploy
+    assert deploy["instance_type"] == expected_instance
+    assert spec.resources() == (expected_instance, original_disk)
+    assert original_disk > 0
+
+
+@pytest.mark.parametrize("mode", [None, "volume"])
+def test_legacy_and_explicit_volume_projection(tmp_path, mode):
+    make_spec, resolved, image, platform, outcome = _build_inputs(tmp_path)
+    spec = make_spec(tmp_path)
+    if mode:
+        spec.data["deployment"]["persistence"] = mode
+    m = mf.build(spec, tmp_path, resolved, image, platform, outcome, Cfg(), "local-volume")
+    deploy = m["website"]["deploy"]
+    assert deploy["instance_type"] == "t3.small"
+    assert deploy["data_volume_gb"] == 30
+    assert deploy["data_path"] == "/var/lib/ghost/content"
+    if mode:
+        assert deploy["persistence"] == mode
+    else:
+        assert "persistence" not in deploy
+
+
+def test_absent_data_path_does_not_infer_none(tmp_path):
+    make_spec, resolved, image, platform, outcome = _build_inputs(tmp_path)
+    spec = make_spec(tmp_path)
+    spec.data["app"]["app_type"] = "stateless_web"
+    del spec.data["deployment"]["data_path"]
+    m = mf.build(spec, tmp_path, resolved, image, platform, outcome, Cfg(), "local-legacy")
+    deploy = m["website"]["deploy"]
+    assert "persistence" not in deploy
+    assert "data_path" not in deploy
+    assert deploy["data_volume_gb"] == spec.resources()[1] > 0
+
+
 def test_app_url_env_name_absent_when_not_registered(tmp_path):
     make_spec, resolved, image, platform, outcome = _build_inputs(tmp_path)
     spec = make_spec(tmp_path, lambda d: d["deployment"].__delitem__("app_url_env_name"))

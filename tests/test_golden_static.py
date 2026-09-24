@@ -93,9 +93,10 @@ def test_retained_data_volume_is_discoverable_by_stack_tags():
     tpl = yaml.safe_load((FIXTURES / "app.yaml").read_text(encoding="utf-8"))
     props = tpl["Resources"]["Instance"]["Properties"]
     assert props["PropagateTagsToVolumeOnCreation"] is True
-    data = next(
-        item for item in props["BlockDeviceMappings"] if item["DeviceName"] == "/dev/sdf"
-    )
+    condition, data, absent = props["BlockDeviceMappings"][1]["Fn::If"]
+    assert condition == "HasDataVolume"
+    assert absent == {"Ref": "AWS::NoValue"}
+    assert data["DeviceName"] == "/dev/sdf"
     assert data["Ebs"]["DeleteOnTermination"] is False
 
 

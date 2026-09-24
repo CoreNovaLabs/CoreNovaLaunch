@@ -348,6 +348,102 @@ def test_rule19_absent_is_fine_for_stateless_app(tmp_path):
     assert errors(tmp_path, m) == []
 
 
+STATELESS_COMPOSE = "services:\n  web:\n    image: ${CORENOVA_APP_IMAGE}\n"
+
+
+def stateless(d):
+    d["app"]["app_type"] = "stateless_web"
+    d["deployment"].pop("data_path", None)
+    d["deployment"]["persistence"] = "none"
+
+
+@pytest.mark.parametrize("name", ["cyberchef", "drawio", "it-tools"])
+def test_registered_stateless_apps_validate(name):
+    root = Path(__file__).resolve().parents[1]
+    spec = appspec.load(name, root)
+    assert spec.g("deployment.persistence") == "none"
+    assert appspec.validate(spec, root, "us-east-1") == []
+
+
+@pytest.mark.parametrize("mode", ["unknown", "", None, False, 0, [], {}])
+def test_persistence_rejects_unknown_values(tmp_path, mode):
+    errs = errors(tmp_path, lambda d: d["deployment"].__setitem__("persistence", mode))
+    assert any("deployment.persistence" in e for e in errs), errs
+
+
+@pytest.mark.parametrize("app_type", sorted(set(profiles.TYPES) - {"stateless_web"}))
+def test_none_requires_stateless_web(tmp_path, app_type):
+    def mutate(d):
+        stateless(d)
+        d["app"]["app_type"] = app_type
+
+    assert any("仅允许 app_type=stateless_web" in e
+               for e in errors(tmp_path, mutate, STATELESS_COMPOSE))
+
+
+@pytest.mark.parametrize("path", ["/data", "", None, False])
+def test_none_rejects_even_empty_explicit_data_path(tmp_path, path):
+    def mutate(d):
+        stateless(d)
+        d["deployment"]["data_path"] = path
+
+    assert any("persistence=none" in e and "data_path" in e
+               for e in errors(tmp_path, mutate, STATELESS_COMPOSE))
+
+
+@pytest.mark.parametrize("section", ["deploy", "deployment"])
+def test_none_rejects_volume_declarations(tmp_path, section):
+    def mutate(d):
+        stateless(d)
+        d[section]["volumes"] = []
+
+    assert any("禁止 volumes" in e for e in errors(tmp_path, mutate, STATELESS_COMPOSE))
+
+
+@pytest.mark.parametrize("compose", [
+    GOOD_COMPOSE,
+    STATELESS_COMPOSE + "volumes: {}\n",
+    STATELESS_COMPOSE + "volumes:\n  data: {}\n",
+    STATELESS_COMPOSE + "  sidecar:\n    volumes: ['/host:/data']\n",
+    STATELESS_COMPOSE + "  sidecar:\n    volumes: ['/data']\n",
+    STATELESS_COMPOSE + "  sidecar:\n    volumes: [{type: bind, source: /host, target: /data}]\n",
+    STATELESS_COMPOSE + "  sidecar:\n    volumes_from: [web]\n",
+    "x-base: &base\n  volumes: ['/host:/data']\nservices:\n  web:\n    <<: *base\n",
+    "services: [invalid]\n",
+    "services: [\n",
+])
+def test_none_rejects_compose_mounts_or_unverifiable_compose(tmp_path, compose):
+    assert any("persistence=none" in e and "volumes" in e
+               for e in errors(tmp_path, stateless, compose))
+
+
+def test_none_rejects_data_dir_write(tmp_path):
+    def mutate(d):
+        stateless(d)
+        d["deployment"]["production_contract"] = {"checks": ["data_dir_write"]}
+
+    assert any("persistence=none 禁止 data_dir_write" in e
+               for e in errors(tmp_path, mutate, STATELESS_COMPOSE))
+
+
+def test_none_valid_without_mounts(tmp_path):
+    assert errors(tmp_path, stateless, STATELESS_COMPOSE) == []
+
+
+@pytest.mark.parametrize("path", [None, "", "relative", "/data;bad"])
+def test_explicit_volume_requires_valid_path(tmp_path, path):
+    def mutate(d):
+        d["app"]["app_type"] = "stateless_web"
+        d["deployment"]["persistence"] = "volume"
+        d["deployment"]["data_path"] = path
+
+    assert errors(tmp_path, mutate)
+
+
+def test_explicit_volume_with_path_valid(tmp_path):
+    assert errors(tmp_path, lambda d: d["deployment"].__setitem__("persistence", "volume")) == []
+
+
 def test_rule20_app_url_env_name_must_be_safe_name(tmp_path):
     def m(d):
         d["deployment"]["app_url_env_name"] = "url; export BAD"

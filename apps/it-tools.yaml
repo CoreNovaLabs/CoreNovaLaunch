@@ -44,6 +44,7 @@ tests:
       en: IT-Tools
       zh: IT-Tools 开发工具箱
 deployment:
+  persistence: none
   size: small
   documentation_url: https://github.com/CorentinTh/it-tools
   regions:

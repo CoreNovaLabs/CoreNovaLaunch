@@ -165,6 +165,12 @@ Manifest: https://pub-xxxx.r2.dev/candidates/ghost/123456/2/<verification_id>/sc
   （`src/lib/deploy.ts`，`VITE_ONE_CLICK_TEMPLATE_URL` 可覆盖），默认值必须与 Repo C `TEMPLATE_S3_BUCKET`
   指向同一只桶（repo-structure.md §4.4）。缺任一强制值时 Deploy 按钮必须禁用并提示
   “需要重新验证”，不得退回模板默认值后仍称为已验证部署。
+- **显式无状态例外**：仅记录携带 `deploy.persistence: none`、`deploy.data_volume_gb: 0` 且没有
+  `deploy.data_path` 时，无应用数据盘部署才成立。深链固定传 `PersistenceMode=none`、
+  `DataVolumeSize=0`、`DataContainerPath=`，不猜目录、不分配或挂载应用数据 EBS；实例系统盘仍存在。
+  其他记录走 `volume`：数据盘至少 8GB、目录必填；无声明且缺字段的历史记录仍须重新验证。
+  `none` 不允许通过资源配置器加数据盘；仍须提供 AMI、镜像 digest、健康检查等其余证据，hold 优先拦截。
+  新声明须经新版验证发布，不能回填旧证据；先发布支持该参数的模板，再验证应用并更新官网。
 - 详情页允许用户在该基线上**主动上调** `InstanceType` 和 `DataVolumeSize`，但不得下调：实例仅显示
   当前 t3 档及更高档，数据卷仅显示当前值及其 2× / 4×（且不超过模板上限 4096 GB）。一旦修改，
   界面必须明确标为“自定义配置 / 未单独验证”，不得继续显示该组合已验证，也不得沿用默认配置的
@@ -270,6 +276,8 @@ Manifest: https://pub-xxxx.r2.dev/candidates/ghost/123456/2/<verification_id>/sc
 
 费用至少包括**实例 + 20GB 系统盘 + 实际数据盘 + 公网 IPv4**；额外流量、快照、日志另计，
 地区、用量与价格以账单为准。`deploy.data_volume_gb` 是数据盘，不是系统盘。
+显式 `deploy.persistence: none` 没有应用数据盘及其保留费用，但系统盘、实例、IPv4、日志等照常计费；
+浏览器文件及处理结果应保存到用户设备，不能把系统盘或浏览器缓存当作应用数据备份。
 
 | 操作 | 资源与数据语义 |
 |------|----------------|
@@ -333,7 +341,8 @@ Ghost 发文、Kuma 监控通知、n8n 工作流，以及容器重启、停写�
 | 部署后指引（后台入口/首次登录方式/注意事项） | `deploy.post_deploy`（源 = app schema `deployment.post_deploy`，app-schema.md 规则17） | ❌ 必须来自 Manifest；无该键的应用前端只渲染平台通用步骤，不得自造后台路径或凭据提示 |
 | 部署区成本估算卡 | `deploy.cost_estimate`（源 = app schema `deployment.cost_estimate`，app-schema.md 规则18） | ❌ 数字与口径均来自 Manifest；前端不得按实例规格自行计算价格 |
 | 容器内数据路径 | `deploy.data_path`（源 = app schema `deployment.data_path`，app-schema.md 规则19） | ❌ 必须来自 Manifest；无该键的应用不显示数据路径，前端不得从 compose 文件推断 |
-| 数据卷容量 | `deploy.data_volume_gb`（源 = app profile / schema 资源解析） | ❌ 必须来自 Manifest；不得误传到系统盘 `DiskGb` |
+| 应用持久化模式 | `deploy.persistence`（源 = app schema `deployment.persistence`） | ❌ 只有显式 `none` 才可无数据盘；不能从缺字段或应用名推断 |
+| 数据卷容量 | `deploy.data_volume_gb`（源 = app profile / schema 资源解析；显式 `none` 为 0） | ❌ 必须来自 Manifest；不得误传到系统盘 `DiskGb` |
 | 就绪探针路径 | `deploy.health_check_path`（源 = app schema `health_check.endpoint`） | ❌ 必须来自 Manifest；不得依赖模板默认 `/` |
 | 应用 URL 环境变量名 | `deploy.app_url_env_name`（源 = app schema `deployment.app_url_env_name`，规则20） | ❌ 必须来自 Manifest；无该键表示无需应用私有 URL 变量 |
 

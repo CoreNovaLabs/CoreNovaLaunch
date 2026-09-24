@@ -186,6 +186,97 @@ def test_plan_rejects_bad_inputs(tmp_path):
                        make_manifest(platform={"ami_id": "latest"}), template_url="")
 
 
+@pytest.mark.parametrize("name", ["cyberchef", "drawio", "it-tools"])
+def test_registered_none_manifest_to_plan(tmp_path, name):
+    from corenova import appspec
+    from tests.test_publish_two_phase import Cfg, _build_inputs
+
+    spec = appspec.load(name, REPO_ROOT)
+    assert appspec.validate(spec, REPO_ROOT, "us-east-1") == []
+    # 三应用尚未声明生产核对清单；仅在内存中添加以测试参数投影。
+    spec.data["deployment"]["production_contract"] = {"checks": ["admin_auth"]}
+    _, resolved, image, platform, outcome = _build_inputs(tmp_path)
+    image.digest = DIGEST
+    m = mf.build(spec, REPO_ROOT, resolved, image, platform, outcome, Cfg(), "local-none")
+    p = prodcheck.plan(make_cfg(tmp_path), spec, m, template_url="https://tpl")
+    assert p.parameters["PersistenceMode"] == "none"
+    assert p.parameters["DataVolumeSize"] == "0"
+    assert p.parameters["DataContainerPath"] == ""
+    assert p.parameters["InstanceType"] == spec.resources()[0]
+    assert m["website"]["deploy"]["data_volume_gb"] == 0
+    assert "data_path" not in m["website"]["deploy"]
+    assert p.checks == ["health_external"]
+    assert [key for key, value in p.parameters.items() if value == ""] == ["DataContainerPath"]
+
+
+def none_plan_inputs():
+    spec = make_spec(["admin_auth"])
+    spec.data["app"] = {"app_type": "stateless_web"}
+    spec.data["deployment"]["persistence"] = "none"
+    m = make_manifest()
+    deploy = m["website"]["deploy"]
+    deploy.update(persistence="none", data_volume_gb=0)
+    del deploy["data_path"]
+    return spec, m
+
+
+@pytest.mark.parametrize("field,value", [
+    ("data_path", "/data"), ("data_path", ""), ("data_path", None),
+    ("data_volume_gb", 20), ("data_volume_gb", None),
+    ("data_volume_gb", False), ("data_volume_gb", "0"),
+    ("volumes", []), ("production_contract", {"checks": ["data_dir_write"]}),
+    ("persistence", "volume"), ("persistence", "unknown"),
+    ("persistence", None), ("persistence", []),
+])
+def test_plan_none_rejects_conflicting_projection(tmp_path, field, value):
+    spec, m = none_plan_inputs()
+    m["website"]["deploy"][field] = value
+    with pytest.raises(ValueError, match="persistence"):
+        prodcheck.plan(make_cfg(tmp_path), spec, m, template_url="https://tpl")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("data_path", "/data"), ("data_path", ""), ("data_path", None),
+    ("volumes", []), ("production_contract", {"checks": ["data_dir_write"]}),
+    ("persistence", "volume"), ("persistence", "unknown"), ("persistence", None),
+])
+def test_plan_none_rejects_conflicting_spec(tmp_path, field, value):
+    spec, m = none_plan_inputs()
+    spec.data["deployment"][field] = value
+    with pytest.raises(ValueError, match="persistence"):
+        prodcheck.plan(make_cfg(tmp_path), spec, m, template_url="https://tpl")
+
+
+def test_plan_none_rejects_wrong_type_or_missing_projection(tmp_path):
+    spec, m = none_plan_inputs()
+    spec.data["app"]["app_type"] = "stateful_app"
+    with pytest.raises(ValueError, match="stateless_web"):
+        prodcheck.plan(make_cfg(tmp_path), spec, m, template_url="https://tpl")
+    spec.data["app"]["app_type"] = "stateless_web"
+    del m["website"]["deploy"]["persistence"]
+    with pytest.raises(ValueError, match="不一致"):
+        prodcheck.plan(make_cfg(tmp_path), spec, m, template_url="https://tpl")
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_plan_volume_keeps_existing_parameters(tmp_path, explicit):
+    spec, m = make_spec(["admin_auth"]), make_manifest()
+    if explicit:
+        spec.data["deployment"].update(persistence="volume", data_path="/var/lib/ghost/content")
+        m["website"]["deploy"]["persistence"] = "volume"
+    q = prodcheck.plan(make_cfg(tmp_path), spec, m, template_url="https://tpl").parameters
+    assert q["DataVolumeSize"] == "30"
+    assert q["DataContainerPath"] == "/var/lib/ghost/content"
+    if explicit:
+        assert q["PersistenceMode"] == "volume"
+    else:
+        assert "PersistenceMode" not in q
+        del m["website"]["deploy"]["data_path"]
+        q = prodcheck.plan(make_cfg(tmp_path), spec, m, template_url="https://tpl").parameters
+        assert q["DataContainerPath"] == "/data"
+        assert q["DataVolumeSize"] == "30"
+
+
 def test_url_env_names_from_manifest():
     names = prodcheck.url_env_names_from(make_manifest())
     assert names == ["url", "PUBLIC_HOOK"]  # 原生变量 + 引用 ${CORENOVA_APP_URL} 的 extra env

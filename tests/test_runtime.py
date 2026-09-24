@@ -47,6 +47,44 @@ def test_compose_receives_same_environment_as_tests(tmp_path, monkeypatch):
     assert kwargs["env"] == env.values
 
 
+@pytest.mark.parametrize("mounts", [[], [{"Type": "volume", "Destination": "/data"}], None, {}])
+def test_stateless_up_checks_actual_mounts(tmp_path, monkeypatch, mounts):
+    _, spec, env = make_env(tmp_path, monkeypatch)
+    spec.data["deployment"] = {"persistence": "none"}
+    monkeypatch.setattr(runtime, "compose", Mock(return_value="started"))
+    monkeypatch.setattr(runtime, "container_id", lambda *args: "owned-id")
+    command = Mock(return_value=SimpleNamespace(stdout=json.dumps(mounts)))
+    monkeypatch.setattr(runtime, "run", command)
+    if mounts == []:
+        assert runtime.up(env, spec, tmp_path) == "started"
+    else:
+        with pytest.raises(RuntimeError, match="存在挂载"):
+            runtime.up(env, spec, tmp_path)
+    command.assert_called_once_with(
+        ["docker", "inspect", "--format", "{{json .Mounts}}", "owned-id"], timeout=60)
+
+
+def test_stateless_up_rejects_missing_container(tmp_path, monkeypatch):
+    _, spec, env = make_env(tmp_path, monkeypatch)
+    spec.data["deployment"] = {"persistence": "none"}
+    monkeypatch.setattr(runtime, "compose", Mock(return_value="started"))
+    monkeypatch.setattr(runtime, "container_id", lambda *args: "")
+    command = Mock()
+    monkeypatch.setattr(runtime, "run", command)
+    with pytest.raises(RuntimeError, match="不存在"):
+        runtime.up(env, spec, tmp_path)
+    command.assert_not_called()
+
+
+def test_legacy_up_does_not_require_empty_mounts(tmp_path, monkeypatch):
+    _, spec, env = make_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(runtime, "compose", Mock(return_value="started"))
+    command = Mock()
+    monkeypatch.setattr(runtime, "run", command)
+    assert runtime.up(env, spec, tmp_path) == "started"
+    command.assert_not_called()
+
+
 def test_missing_runtime_identity_fails_instead_of_skipping():
     with pytest.raises(AssertionError, match="Runner must pass CORENOVA_COMPOSE_FILE"):
         DockerApp({"CORENOVA_APP_URL": "http://localhost:1234"})

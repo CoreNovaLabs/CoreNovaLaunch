@@ -73,6 +73,69 @@ def test_user_interface_exposes_complete_verified_runtime_contract(tmp_path):
     } <= grouped
 
 
+def test_persistence_rules_and_conditions_survive_merge(tmp_path):
+    tpl = build(tmp_path)
+    fixed = yaml.safe_load((ROOT / "templates/cloudformation/fixed/app.yaml").read_text())
+    canary = yaml.safe_load((ROOT / "templates/cloudformation/fixed/canary.yaml").read_text())
+    assert tpl["Rules"] == fixed["Rules"] == canary["Rules"]
+    assert tpl["Conditions"]["HasDataVolume"] == {"Fn::Equals": [{"Ref": "PersistenceMode"}, "volume"]}
+    for template in (tpl, fixed, canary):
+        params = template["Parameters"]
+        assert params["PersistenceMode"]["Default"] == "volume"
+        assert params["PersistenceMode"]["AllowedValues"] == ["volume", "none"]
+        assert params["DataVolumeSize"]["Default"] >= 8
+        assert params["DataVolumeSize"]["MinValue"] == 0
+        assert params["DataContainerPath"]["Default"] == "/data"
+        import re
+        assert re.fullmatch(params["DataContainerPath"]["AllowedPattern"], "")
+        instance = template["Resources"]["Instance"]
+        mappings = instance["Properties"]["BlockDeviceMappings"]
+        assert len(mappings) == 2
+        assert mappings[0]["DeviceName"] == "/dev/sda1"
+        condition, present, absent = mappings[1]["Fn::If"]
+        assert condition == "HasDataVolume"
+        assert absent == {"Ref": "AWS::NoValue"}
+        assert present == {"DeviceName": "/dev/sdf", "Ebs": {
+            "VolumeType": "gp3", "VolumeSize": {"Ref": "DataVolumeSize"},
+            "Encrypted": True, "DeleteOnTermination": False,
+        }}
+        env = instance["Metadata"]["AWS::CloudFormation::Init"]["20-assets"]["files"][
+            "/opt/corenova/etc/init.env"]["content"]["Fn::Sub"][0]
+        assert 'export CFNOVA_PERSISTENCE="${PersistenceMode}"' in env
+        assert 'export CFNOVA_DATA_VOLUME_SIZE="${DataVolumeSize}"' in env
+        assert 'export CFNOVA_DATA_CONTAINER_PATH="${DataContainerPath}"' in env
+
+
+@pytest.mark.parametrize("mode,size,path,valid", [
+    ("none", 0, "", True), ("none", 30, "", False), ("none", 0, "/data", False),
+    ("volume", 8, "/data", True), ("volume", 4096, "/custom", True),
+    ("volume", 30, "", False),
+    *[("volume", size, "/data", False) for size in range(8)],
+])
+def test_persistence_rule_assertions(mode, size, path, valid):
+    tpl = yaml.safe_load((ROOT / "templates/cloudformation/fixed/app.yaml").read_text())
+    values = {"PersistenceMode": mode, "DataVolumeSize": str(size), "DataContainerPath": path}
+
+    def evaluate(node):
+        if not isinstance(node, dict):
+            return node
+        if "Ref" in node:
+            return values[node["Ref"]]
+        name, args = next(iter(node.items()))
+        resolved = [evaluate(arg) for arg in args]
+        if name == "Fn::Equals":
+            return resolved[0] == resolved[1]
+        if name == "Fn::Not":
+            return not resolved[0]
+        if name == "Fn::Contains":
+            return resolved[1] in resolved[0]
+        pytest.fail(f"Unsupported Rules function: {name}")
+
+    accepted = all(evaluate(assertion["Assert"]) for rule in tpl["Rules"].values()
+                   if evaluate(rule["RuleCondition"]) for assertion in rule["Assertions"])
+    assert accepted is valid
+
+
 def test_one_click_template_requires_the_verified_ami(tmp_path):
     tpl = build(tmp_path)
     assert tpl["Parameters"]["AmiId"]["Type"] == "AWS::EC2::Image::Id"
