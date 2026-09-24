@@ -119,14 +119,16 @@ def find_issue(record: FailureRecord) -> dict[str, Any] | None:
     repo = repo_name()
     if not repo:
         return None
-    q = f"repo:{repo} is:issue in:body {record.verification_id}"
+    q = f"repo:{repo} is:issue is:open in:body {record.verification_id}"
     try:
         hits = http_json(f"https://api.github.com/search/issues?q={_urlencode(q, safe='')}&per_page=5", headers=_headers())
     except HttpError as exc:
         log(f"查询失败台账出错（忽略）：{exc}")
         return None
     for it in hits.get("items") or []:
-        if record.verification_id in (it.get("body") or ""):
+        if "state" in it and it["state"] != "open":
+            continue
+        if meta_from_body(it.get("body") or "").get("verification_id") == record.verification_id:
             return it
     return None
 
@@ -147,7 +149,7 @@ def record_failure(record: FailureRecord) -> None:
                 f"https://api.github.com/repos/{repo}/issues/{number}",
                 method="PATCH",
                 headers=_headers(),
-                data={"body": record.body(), "labels": record.labels(), "state": "open"},
+                data={"title": record.title(), "body": record.body(), "labels": record.labels(), "state": "open"},
             )
             log(f"失败台账已更新 #{number}（attempt {record.attempts}）")
         else:

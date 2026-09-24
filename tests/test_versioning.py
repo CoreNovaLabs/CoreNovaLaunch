@@ -13,8 +13,11 @@ check_versions.compare（监控扇出）、golden/platformref 的 _age_days（�
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import pathlib
+import urllib.error
+from types import SimpleNamespace
 
 import pytest
 
@@ -191,3 +194,170 @@ class TestMonitorPublishConsistency:
             backend = _backend_with_current(tmp_path, f"b-{i}", current, "1000")
             ok, why = publish.may_update_current(backend, "app", candidate, "999", "release_tag")
             assert not ok, f"监控判 older 但 P5 放行回退：{candidate} vs {current} —— {why}"
+
+
+class TestImagePreflight:
+    ref = "jgraph/drawio:31.5.2"
+    url = "https://registry-1.docker.io/v2/jgraph/drawio/manifests/31.5.2"
+
+    @pytest.fixture
+    def probe(self, monkeypatch):
+        calls, waits = [], []
+        replies = []
+
+        def resolve(ref, mirror):
+            calls.append((ref, mirror))
+            reply = replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        monkeypatch.setattr(cv.resolver, "resolve_digest", resolve)
+        monkeypatch.setattr(cv.time, "sleep", waits.append)
+        return replies, calls, waits
+
+    def missing(self, url=None, body=None):
+        return cv.HttpError(404, url or self.url, body or json.dumps({
+            "errors": [{"code": "MANIFEST_UNKNOWN"}],
+        }))
+
+    def test_missing_manifest_is_bounded_and_held(self, probe):
+        replies, calls, waits = probe
+        replies.extend([self.missing()] * 3)
+        result = cv.image_preflight(self.ref, "")
+        assert result["decision"] == "hold"
+        assert result["classification"] == "MANUAL_REQUIRED"
+        assert "下轮监控" in result["reason"]
+        assert calls == [(self.ref, "")] * 3
+        assert waits == [5, 10]
+
+    def test_eventual_image_publication_allows_dispatch(self, probe):
+        replies, calls, waits = probe
+        replies.extend([self.missing(), self.missing(), object()])
+        assert cv.image_preflight(self.ref, "") == {}
+        assert len(calls) == 3
+        assert waits == [5, 10]
+
+    @pytest.mark.parametrize("body", ["Not Found", "[]", '{"errors":{}}',
+                                      '{"errors":[{"code":"NAME_UNKNOWN"}]}'])
+    def test_other_404_is_not_publication_delay(self, probe, body):
+        replies, calls, waits = probe
+        replies.append(self.missing(body=body))
+        result = cv.image_preflight(self.ref, "")
+        assert result["decision"] == "error"
+        assert len(calls) == 1 and waits == []
+
+    def test_token_endpoint_404_is_not_missing_manifest(self, probe):
+        replies, calls, waits = probe
+        replies.append(self.missing(url="https://auth.docker.io/token"))
+        assert cv.image_preflight(self.ref, "")["decision"] == "error"
+        assert len(calls) == 1 and waits == []
+
+    def test_full_error_body_is_parsed_not_truncated_message(self, probe):
+        replies, _, waits = probe
+        body = json.dumps({"padding": "x" * 500, "errors": [{"code": "MANIFEST_UNKNOWN"}]})
+        replies.extend([self.missing(body=body)] * 3)
+        assert cv.image_preflight(self.ref, "")["decision"] == "hold"
+        assert waits == [5, 10]
+
+    @pytest.mark.parametrize("error,classification", [
+        (cv.HttpError(401, url, "unauthorized"), "MANUAL_REQUIRED"),
+        (cv.HttpError(429, url, "rate limited"), "TRANSIENT"),
+        (TimeoutError("timed out"), "TRANSIENT"),
+        (ValueError("platform linux/amd64 missing"), "MANUAL_REQUIRED"),
+    ])
+    def test_other_errors_are_visible_without_nested_retries(self, probe, error, classification):
+        replies, calls, waits = probe
+        replies.append(error)
+        result = cv.image_preflight(self.ref, "")
+        assert result["decision"] == "error"
+        assert result["classification"] == classification
+        assert len(calls) == 1 and waits == []
+
+    def test_missing_then_rate_limited_stops_waiting(self, probe):
+        replies, calls, waits = probe
+        replies.extend([self.missing(), cv.HttpError(429, self.url, "rate limited")])
+        result = cv.image_preflight(self.ref, "")
+        assert result["decision"] == "error" and result["classification"] == "TRANSIENT"
+        assert len(calls) == 2 and waits == [5]
+
+    def test_http_retry_budget_is_not_multiplied(self, monkeypatch):
+        from corenova import util
+
+        calls, waits = [], []
+
+        def open_request(request, timeout):
+            calls.append(request.full_url)
+            raise urllib.error.HTTPError(request.full_url, 429, "rate limited", {}, io.BytesIO(b"rate limited"))
+
+        monkeypatch.setattr(cv.resolver, "_registry_token", lambda *a: "")
+        monkeypatch.setattr(util, "_opener", lambda: SimpleNamespace(open=open_request))
+        monkeypatch.setattr(util.time, "sleep", waits.append)
+        result = cv.image_preflight(self.ref, "")
+        assert result["decision"] == "error" and result["classification"] == "TRANSIENT"
+        assert calls == [self.url] * 3
+        assert waits == [1, 2]
+
+    def test_mirror_is_preserved(self, probe):
+        replies, calls, waits = probe
+        mirror = "mirror.example.test"
+        replies.extend([self.missing(url=f"https://{mirror}/v2/jgraph/drawio/manifests/31.5.2"), object()])
+        assert cv.image_preflight(self.ref, mirror) == {}
+        assert calls == [(self.ref, mirror)] * 2
+        assert waits == [5]
+
+    @pytest.fixture
+    def monitor(self, monkeypatch, tmp_path):
+        cfg = SimpleNamespace(root=REPO_ROOT, registry_mirror="", verified_backend="dir", output_dir=tmp_path)
+        resolved = SimpleNamespace(app_version="v31.5.2", release_tag="v31.5.2", release_type="new_version",
+                                   type_evidence="test", published_at="2026-09-23T18:13:03Z", source_revision="abc")
+        monkeypatch.setattr(cv.publish, "current_version", lambda *a: "v31.5.1")
+        monkeypatch.setattr(cv.resolver, "pick_release", lambda *a, **kw: resolved)
+        gh = SimpleNamespace(latest_release=lambda *a: {"published_at": resolved.published_at})
+        return cfg, gh
+
+    def test_inspect_never_dispatches_unavailable_image(self, monitor, probe):
+        cfg, gh = monitor
+        replies, calls, _ = probe
+        replies.extend([self.missing()] * 3)
+        entry = cv.inspect_app("drawio", cfg, gh, 6, durable=True)
+        assert entry["decision"] == "hold" and not entry["dispatch"]
+        assert entry["classification"] == "MANUAL_REQUIRED"
+        assert entry["app_version"] == "v31.5.2"
+        assert entry["image_ref"] == self.ref
+        assert len(calls) == 3
+        summary = cv.render_markdown({"entries": [entry], "backend": "r2", "apps_checked": 1,
+                                      "errors": 0, "durable_current_source": True})
+        assert "不代表验证通过" in summary and "MANIFEST_UNKNOWN" in summary
+        assert "暂缓（无持久事实源）" not in summary
+
+    def test_next_monitor_round_can_recover_without_state(self, monitor, probe):
+        cfg, gh = monitor
+        replies, calls, waits = probe
+        replies.extend([self.missing()] * 3 + [object()])
+        held = cv.inspect_app("drawio", cfg, gh, 6, durable=True)
+        ready = cv.inspect_app("drawio", cfg, gh, 6, durable=True)
+        assert held["decision"] == "hold" and not held["dispatch"]
+        assert ready["decision"] == "dispatch" and ready["dispatch"]
+        assert len(calls) == 4 and waits == [5, 10]
+
+    def test_inspect_ready_image_remains_dispatchable(self, monitor, probe):
+        cfg, gh = monitor
+        replies, calls, _ = probe
+        replies.append(object())
+        entry = cv.inspect_app("drawio", cfg, gh, 6, durable=True)
+        assert entry["dispatch"] and entry["decision"] == "dispatch"
+        assert entry["classification"] == ""
+        assert calls == [(self.ref, "")]
+
+    @pytest.mark.parametrize("current,durable,decision", [
+        ("v31.5.2", True, "skip"), ("v31.5.3", True, "skip"), (None, False, "hold"),
+    ])
+    def test_non_dispatch_decisions_do_not_query_registry(self, monitor, probe, monkeypatch,
+                                                        current, durable, decision):
+        cfg, gh = monitor
+        _, calls, _ = probe
+        monkeypatch.setattr(cv.publish, "current_version", lambda *a: current)
+        entry = cv.inspect_app("drawio", cfg, gh, 6, durable=durable)
+        assert entry["decision"] == decision and not entry["dispatch"]
+        assert calls == []

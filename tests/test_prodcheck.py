@@ -7,8 +7,18 @@ poll_until monkeypatch 成"执行一次即定论"；hold 手术与 Manifest 投�
 
 from __future__ import annotations
 
+import builtins
+import io
+import json
+import os
+import shlex
+import subprocess
+import sys
+import uuid
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -343,11 +353,17 @@ def test_data_dir_write_script_and_pass(fast_poll):
     result = prodcheck.CHECK_FNS["data_dir_write"](ctx)
     assert result.passed
     script = seen[0]
-    # 必须以镜像自身用户执行（root 写永远成功，测不出 bind mount 权限）
-    assert "{{.Config.User}}" in script
-    assert 'docker exec -u "$uid_gid" ghost' in script
-    assert "/var/lib/ghost/content/.corenova-probe" in script
-    assert f"ghost:6.61.0-alpine@{DIGEST}" in script  # 钉扎镜像本体，不是浮动 tag
+    argv = shlex.split(script)
+    assert argv[:2] == ["python3", "-c"]
+    assert argv[3:] == ["ghost", f"ghost:6.61.0-alpine@{DIGEST}", "/var/lib/ghost/content"]
+    # 从真实进程取身份，不依赖镜像内 shell/env 或 Config.User。
+    source = argv[2]
+    assert 'proc / "status"' in source
+    assert "os.setgroups(" in source and "os.setgid(" in source and "os.setuid(" in source
+    assert '".corenova-probe-" + uuid.uuid4().hex' in source
+    assert "os.O_EXCL" in source and "os.O_NOFOLLOW" in source
+    assert "docker exec" not in script and "sh -c" not in script
+    assert "Config.User" not in script
 
 
 def test_data_dir_write_failure_detail(fast_poll):
@@ -361,11 +377,7 @@ def test_data_dir_write_failure_detail(fast_poll):
 
 def test_url_injection_trailing_slash_normalized():
     dns = "ec2-1-2.compute-1.amazonaws.com"
-    env_out = (
-        "url=http://localhost:8080\n"
-        "PUBLIC_HOOK=http://localhost:8080/hook\n"
-        "OTHER=whatever\n"
-    )
+    env_out = json.dumps({"url": True, "PUBLIC_HOOK": True})
     ctx = CheckCtx(plan=make_plan({}, ["url_injection"]), instance_id="i", public_dns=dns,
                    container="ghost", image_ref="img", data_path="/data",
                    url_env_names=["url", "PUBLIC_HOOK"], run_script=lambda s: inv(env_out))
@@ -377,7 +389,7 @@ def test_url_injection_wrong_value_fails():
     ctx = CheckCtx(plan=make_plan({}, ["url_injection"]), instance_id="i",
                    public_dns="ec2-x.compute-1.amazonaws.com", container="ghost",
                    image_ref="img", data_path="/data", url_env_names=["url"],
-                   run_script=lambda s: inv("url=http://localhost:2368\n"))
+                   run_script=lambda s: inv(json.dumps({"url": False})))
     result = prodcheck.CHECK_FNS["url_injection"](ctx)
     assert not result.passed
     assert "url=" in result.detail  # 指出哪个变量不符
@@ -388,6 +400,263 @@ def test_url_injection_needs_declared_names():
                    container="ghost", image_ref="img", data_path="/data",
                    run_script=lambda s: inv(""))
     assert not prodcheck.CHECK_FNS["url_injection"](ctx).passed
+
+
+def _execute_host_probe(command, modules):
+    """执行真实 -c 内容；导入白名单避免碰宿主 Docker、/proc 或身份。"""
+    argv = shlex.split(command)
+    assert argv[:2] == ["python3", "-c"]
+    assert "docker exec" not in command and "sh -c" not in command
+    imports = {"json": json, "sys": SimpleNamespace(argv=["-c", *argv[3:]], exit=sys.exit),
+               **modules}
+
+    def sandbox_import(name, *args, **kwargs):
+        assert name in imports, f"unexpected script import: {name}"
+        return imports[name]
+
+    stdout = io.StringIO()
+    code, error = 0, ""
+    with redirect_stdout(stdout):
+        try:
+            exec(compile(argv[2], "<host-probe>", "exec"),
+                 {"__builtins__": {**vars(builtins), "__import__": sandbox_import}})
+        except SystemExit as exc:
+            code = exc.code
+        except (RuntimeError, OSError) as exc:
+            code, error = 1, str(exc)
+    return inv(stdout.getvalue(), code=code, error=error)
+
+
+@pytest.fixture
+def write_probe_sandbox(tmp_path):
+    source = tmp_path / "bind source"
+    source.mkdir()
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    identity_map = "         0          0 4294967295\n"
+    for name in ("uid_map", "gid_map"):
+        (proc / name).write_text(identity_map)
+    # Config.User 故意与真实进程不同，且附加组不能丢失。
+    (proc / "status").write_text(
+        "Name:\tapp\nUid:\t1001\t1001\t1001\t1001\n"
+        "Gid:\t1002\t1002\t1002\t1002\nGroups:\t1002 44 55\n")
+    info = {"Image": DIGEST, "State": {"Running": True, "Pid": 321},
+            "Config": {"User": "0:0"},
+            "Mounts": [{"Destination": "/data", "Source": str(source),
+                        "Type": "bind", "RW": True}]}
+    calls, events, opened, streams, outputs = [], [], [], [], []
+    image_ref = f"ghost:6.61.0-alpine@{DIGEST}"
+
+    def check_output(argv, **kwargs):
+        calls.append(argv)
+        if argv == ["docker", "inspect", "ghost"]:
+            assert kwargs == {}
+            return json.dumps([info]).encode()
+        assert argv == ["docker", "image", "inspect", "--format", "{{.Id}}", image_ref]
+        assert kwargs == {"text": True}
+        return DIGEST + "\n"
+
+    def sandbox_path(path):
+        # 不允许读取真实 /proc；其余唯一路径是测试创建的 bind source。
+        if path == "/proc/321":
+            return proc
+        assert path == str(source)
+        return source
+
+    def open_marker(path, flags, mode):
+        assert events == [("setgroups", [1002, 44, 55]), ("setgid", 1002), ("setuid", 1001)]
+        assert path.parent == source
+        assert path.name.startswith(".corenova-probe-")
+        assert uuid.UUID(hex=path.name.removeprefix(".corenova-probe-")).version == 4
+        assert flags == os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW
+        assert mode == 0o600
+        opened.append(path)
+        return os.open(path, flags, mode)
+
+    @contextmanager
+    def fdopen(fd, mode):
+        assert mode == "w+b"
+        with os.fdopen(fd, mode) as stream:
+            wrapped = Mock(wraps=stream)
+            streams.append(wrapped)
+            yield wrapped
+            # 使用独立文件描述符确认落盘内容，不仅仅检查 mock 调用。
+            assert opened[-1].read_bytes() == b"corenova-write-probe"
+
+    fake_os = SimpleNamespace(
+        setgroups=lambda groups: events.append(("setgroups", groups)),
+        setgid=lambda gid: events.append(("setgid", gid)),
+        setuid=lambda uid: events.append(("setuid", uid)),
+        open=open_marker, fdopen=fdopen,
+        O_CREAT=os.O_CREAT, O_EXCL=os.O_EXCL, O_RDWR=os.O_RDWR, O_NOFOLLOW=os.O_NOFOLLOW,
+    )
+    modules = {"os": fake_os, "pathlib": SimpleNamespace(Path=sandbox_path),
+               "subprocess": SimpleNamespace(check_output=check_output), "uuid": uuid}
+
+    def run_script(command):
+        result = _execute_host_probe(command, modules)
+        outputs.append(result)
+        return result
+
+    ctx = CheckCtx(plan=make_plan({}, ["data_dir_write"]), instance_id="i", public_dns="",
+                   container="ghost", image_ref=image_ref, data_path="/data", run_script=run_script)
+    return SimpleNamespace(ctx=ctx, info=info, source=source, proc=proc, events=events,
+                           opened=opened, streams=streams, calls=calls, outputs=outputs)
+
+
+def test_data_dir_write_real_script_identity_and_file_lifecycle(write_probe_sandbox):
+    sandbox = write_probe_sandbox
+    result = prodcheck.CHECK_FNS["data_dir_write"](sandbox.ctx)
+    assert result.passed, result.detail
+    assert sandbox.events == [("setgroups", [1002, 44, 55]), ("setgid", 1002), ("setuid", 1001)]
+    assert len(sandbox.calls) == 2  # 严格 mock 只允许两次 inspect，绝无 exec/sh/env。
+    assert len(sandbox.opened) == 1
+    assert list(sandbox.source.iterdir()) == []
+    assert not sandbox.opened[0].exists()
+    stream = sandbox.streams[0]
+    assert [call[0] for call in stream.mock_calls] == ["write", "flush", "seek", "read"]
+    stream.write.assert_called_once_with(b"corenova-write-probe")
+    stream.seek.assert_called_once_with(0)
+    stream.read.assert_called_once_with()
+    assert sandbox.outputs[0].stdout == "write-ok\n"
+
+
+@pytest.mark.parametrize("fault, message", [
+    ("image", "image or running state mismatch"),
+    ("stopped", "image or running state mismatch"),
+    ("readonly", "writable data bind mount"),
+    ("nonbind", "writable data bind mount"),
+    ("missingmount", "writable data bind mount"),
+    ("destination-prefix", "writable data bind mount"),
+    ("duplicate-mount", "writable data bind mount"),
+    ("pid", "invalid container pid"),
+    ("uid_map", "namespace mapping"),
+    ("gid_map", "namespace mapping"),
+    ("mixeduids", "mixed process credentials"),
+    ("mixedgids", "mixed process credentials"),
+])
+def test_data_dir_write_real_script_fails_closed(write_probe_sandbox, fault, message):
+    sandbox = write_probe_sandbox
+    info = sandbox.info
+    if fault == "image":
+        info["Image"] = "sha256:" + "b" * 64
+    elif fault == "stopped":
+        info["State"]["Running"] = False
+    elif fault == "readonly":
+        info["Mounts"][0]["RW"] = False
+    elif fault == "nonbind":
+        info["Mounts"][0]["Type"] = "volume"
+    elif fault == "missingmount":
+        info["Mounts"] = []
+    elif fault == "destination-prefix":
+        info["Mounts"][0]["Destination"] = "/data/child"
+    elif fault == "duplicate-mount":
+        info["Mounts"] *= 2
+    elif fault == "pid":
+        info["State"]["Pid"] = 0
+    elif fault in ("uid_map", "gid_map"):
+        (sandbox.proc / fault).write_text("0 100000 65536\n")
+    else:
+        status = sandbox.proc / "status"
+        old = "1001\t1001\t1001\t1001" if fault == "mixeduids" else "1002\t1002\t1002\t1002"
+        status.write_text(status.read_text().replace(old, "0\t1001\t1001\t1001"))
+    result = prodcheck.CHECK_FNS["data_dir_write"](sandbox.ctx)
+    assert not result.passed
+    assert message in result.detail
+    assert sandbox.outputs[0].exit_code != 0
+    assert sandbox.events == [] and sandbox.opened == []
+    assert list(sandbox.source.iterdir()) == []
+
+
+@pytest.mark.parametrize("value, allowed", [
+    ("http://localhost:8080", True),
+    ("http://localhost:8080/", True),
+    ("http://localhost:8080/hook/nested/", True),
+    ("http://localhost:8080/hook?token=" + SECRET, True),
+    ("http://localhost:2368/" + SECRET, False),
+    ("https://localhost:8080/" + SECRET, False),
+    ("http://localhost:8080.evil/" + SECRET, False),
+    ("http://localhost:8080@evil/" + SECRET, False),
+    ("http://localhost:8080?token=" + SECRET, False),
+    (None, False),
+])
+def test_url_injection_real_script_boolean_only(value, allowed):
+    calls, outputs = [], []
+    environment = ["OTHER_SECRET=unrelated-secret-value",
+                   "PUBLIC_HOOK=http://localhost:8080/hook"]
+    if value is not None:
+        environment.append("url=" + value)
+
+    def check_output(argv, **kwargs):
+        calls.append(argv)
+        assert argv == ["docker", "inspect", "--format", "{{json .Config.Env}}", "ghost"]
+        assert kwargs == {}
+        return json.dumps(environment).encode()
+
+    def run_script(command):
+        result = _execute_host_probe(command, {"subprocess": SimpleNamespace(check_output=check_output)})
+        outputs.append(result)
+        return result
+
+    ctx = CheckCtx(plan=make_plan({}, ["url_injection"]), instance_id="i", public_dns="",
+                   container="ghost", image_ref="img", data_path="/data",
+                   url_env_names=["url", "PUBLIC_HOOK"], run_script=run_script)
+    result = prodcheck.CHECK_FNS["url_injection"](ctx)
+    assert result.passed is allowed
+    assert len(calls) == 1
+    assert json.loads(outputs[0].stdout) == {"url": allowed, "PUBLIC_HOOK": True}
+    evidence = outputs[0].stdout + repr(result)
+    for private in (SECRET, "OTHER_SECRET", "unrelated-secret-value", "http://localhost"):
+        assert private not in evidence
+    if not allowed:
+        assert "url=不符或缺失" in result.detail
+
+
+@pytest.mark.parametrize("failure", ["exec", "malformed-env"])
+def test_url_injection_real_script_error_does_not_leak(failure):
+    outputs = []
+
+    def check_output(argv, **kwargs):
+        assert argv == ["docker", "inspect", "--format", "{{json .Config.Env}}", "ghost"]
+        if failure == "exec":
+            raise subprocess.CalledProcessError(1, argv, output=SECRET, stderr="OTHER_SECRET=" + SECRET)
+        return ("malformed OTHER_SECRET=" + SECRET).encode()
+
+    def run_script(command):
+        result = _execute_host_probe(command, {"subprocess": SimpleNamespace(check_output=check_output)})
+        outputs.append(result)
+        return result
+
+    ctx = CheckCtx(plan=make_plan({}, ["url_injection"]), instance_id="i", public_dns="",
+                   container="ghost", image_ref="img", data_path="/data",
+                   url_env_names=["url"], run_script=run_script)
+    result = prodcheck.CHECK_FNS["url_injection"](ctx)
+    assert not result.passed
+    assert outputs[0].exit_code == 1
+    assert outputs[0].stdout.strip() == ("CalledProcessError" if failure == "exec" else "JSONDecodeError")
+    assert SECRET not in outputs[0].stdout + repr(result)
+    assert "OTHER_SECRET" not in outputs[0].stdout + repr(result)
+
+
+@pytest.mark.parametrize("stdout, code", [
+    ('{"url": true}', 1),
+    ("url=http://localhost:8080?token=" + SECRET, 0),
+    ("not-json " + SECRET, 0),
+    ("[]", 0),
+    ("null", 0),
+    ("{}", 0),
+    ('{"url": "true"}', 0),
+    ('{"url": 1}', 0),
+    ('{"url": null}', 0),
+    (json.dumps({"url": "http://wrong.example/" + SECRET, "OTHER_SECRET": SECRET}), 0),
+])
+def test_url_injection_rejects_failed_or_malformed_results(stdout, code):
+    ctx = CheckCtx(plan=make_plan({}, ["url_injection"]), instance_id="i", public_dns="",
+                   container="ghost", image_ref="img", data_path="/data", url_env_names=["url"],
+                   run_script=lambda s: inv(stdout, code=code, error="OTHER_SECRET=" + SECRET))
+    result = prodcheck.CHECK_FNS["url_injection"](ctx)
+    assert not result.passed
+    assert SECRET not in repr(result) and "OTHER_SECRET" not in repr(result)
 
 
 def test_host_metrics():

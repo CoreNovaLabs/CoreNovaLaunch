@@ -31,7 +31,7 @@ from typing import Any
 from corenova import appspec, publish, resolver
 from corenova.config import Config
 from corenova.failure import classify
-from corenova.util import log, utcnow
+from corenova.util import HttpError, log, utcnow
 from corenova.versioning import relation as version_relation
 from corenova.versioning import semver_relation
 
@@ -122,6 +122,44 @@ def is_durable(cfg: Config) -> bool:
     return (cfg.output_dir / "verified").is_dir()
 
 
+def image_preflight(image_ref: str, mirror: str) -> dict[str, str]:
+    _, repo, tag, host = resolver.split_image(image_ref, mirror)
+    manifest_url = f"https://{host}/v2/{repo}/manifests/{tag}"
+    for attempt in range(3):
+        try:
+            resolver.resolve_digest(image_ref, mirror)
+            return {}
+        except Exception as exc:  # noqa: BLE001
+            missing = False
+            if isinstance(exc, HttpError) and exc.status == 404 and exc.url == manifest_url:
+                try:
+                    body = json.loads(exc.body)
+                except ValueError:
+                    body = None
+                errors = body.get("errors") if isinstance(body, dict) else None
+                missing = isinstance(errors, list) and any(
+                    isinstance(error, dict) and error.get("code") == "MANIFEST_UNKNOWN"
+                    for error in errors
+                )
+            if not missing:
+                return {
+                    "decision": "error",
+                    "classification": classify("RESOLVED", "resolve_digest", exc),
+                    "reason": f"精确镜像预检失败（不扇出）：{type(exc).__name__}: {exc}",
+                }
+            if attempt == 2:
+                return {
+                    "decision": "hold",
+                    "classification": "MANUAL_REQUIRED",
+                    "reason": f"精确镜像 {image_ref} 尚未就绪（MANIFEST_UNKNOWN，已查询 3 次）；"
+                              "本轮不扇出，下轮监控重新检查。持续缺失需人工核对上游镜像发布。",
+                }
+            delay = 5 * 2 ** attempt
+            log(f"精确镜像 {image_ref} 尚未就绪，{delay}s 后再次查询（不启动验证）")
+            time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
 def inspect_app(
     name: str, cfg: Config, gh: resolver.GitHub, min_age_hours: int,
     *, durable: bool | None = None, allow_non_durable: bool = False,
@@ -188,6 +226,15 @@ def inspect_app(
             "classification": "",
         }
     )
+    if entry["dispatch"]:
+        try:
+            image_ref = appspec.render_image_ref(spec, resolved.app_version)
+            entry["image_ref"] = image_ref
+            entry.update(image_preflight(image_ref, cfg.registry_mirror))
+        except Exception as exc:  # noqa: BLE001
+            entry.update(decision="error", classification=classify("RESOLVED", "resolve_digest", exc),
+                         reason=f"精确镜像预检失败：{type(exc).__name__}: {exc}")
+        entry["dispatch"] = entry["decision"] == "dispatch"
     return entry
 
 
@@ -200,7 +247,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
         f"- 生效后端：`{payload['backend']}`（事实源 `verified/<app>/current.json`）"
         f"，跨 run 可用：**{'是' if payload.get('durable_current_source') else '否'}**",
         f"- 检查应用：{payload['apps_checked']}，待验证扇出：**{len(pending)}**，"
-        f"暂缓（无持久事实源）：{len(held)}，解析失败：{payload['errors']}",
+        f"暂缓（后端或镜像未就绪）：{len(held)}，解析/预检失败：{payload['errors']}",
         "",
         "| app | upstream | strategy | 上游版本 | 已发布 | 关系 | 决策 | 依据 |",
         "|-----|----------|----------|---------|--------|------|------|------|",
@@ -224,7 +271,7 @@ def render_markdown(payload: dict[str, Any]) -> str:
         for e in errors:
             lines.append(f"- `{e['app']}` [{e.get('classification') or '?'}] {e.get('reason')}")
     if held:
-        lines += ["", "### 本轮暂缓扇出（后端无持久 current.json）", ""]
+        lines += ["", "### 本轮暂缓扇出（不代表验证通过）", ""]
         lines += [f"- `{e['app']}` → `{e.get('app_version')}`：{e.get('reason')}" for e in held]
     if payload.get("dispatches"):
         lines += ["", "### 扇出结果", ""]

@@ -91,6 +91,7 @@ class HttpError(RuntimeError):
         super().__init__(f"HTTP {status} for {url}: {body[:400]}")
         self.status = status
         self.url = url
+        self.body = body
 
 
 def _opener() -> urllib.request.OpenerDirector:

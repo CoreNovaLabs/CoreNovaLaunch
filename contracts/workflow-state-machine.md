@@ -154,8 +154,10 @@ FAILED(APPLICATION|TEST)
 |----|------|
 | 标题 | `verify(<app>): <app_version> FAILED (<classification>)` |
 | Label | `verify-failed` + `classification:<TRANSIENT\|APPLICATION\|TEST\|INFRASTRUCTURE\|MANUAL_REQUIRED>` + `app:<app>` |
-| 幂等键 | 正文 fenced `corenova-failure` JSON 块的 `verification_id`；同 `verification_id` 再次失败 → **更新同一 issue**（追加 attempt），不新建 |
+| 幂等键 | 正文 fenced `corenova-failure` JSON 块的 `verification_id` 完整匹配；同 ID 的开放 issue 再次失败 → **更新同一 issue**（追加 attempt，同步标题），不重新打开已关闭 issue |
 | Assign / 状态 | `MANUAL_REQUIRED` 打 `needs-human`；`FIX_PR` 由 AI 分支引用该 issue（`Fixes #N`） |
+
+早期镜像解析失败必须保留已解析的 `app_version`，使用 `pre-verification-{app}-{清洗后的版本}` 隔离不同版本；版本尚未解析才写 `unknown`，并按应用和失败检查隔离 ID。进入验证后保留已分配的 ID。Actions 中即使早期失败也须写 `run_url`，不得把 CLI 指定版本当作已解析结果。历史 `unknown` 记录不得按猜测自动关闭，需人工核对成功证据。
 
 正文 metadata 块（机器可读，`reverify-failed` 据此筛选）：
 

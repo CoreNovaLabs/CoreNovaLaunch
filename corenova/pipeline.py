@@ -23,14 +23,18 @@ from .backend import make_backend
 from .config import Config
 from .failure import FailureRecord, classify, record_failure, resolve_failures
 from .gh import github_headers
-from .util import die, http_request, log, utcnow
+from .util import die, http_request, log, sanitize_for_id, utcnow
 from .util import run as sh
 
 
 class StageError(RuntimeError):
-    def __init__(self, stage: str, check: str, err: BaseException):
+    def __init__(
+        self, stage: str, check: str, err: BaseException, *,
+        app_version: str = "", verification_id: str = "",
+    ):
         super().__init__(f"{stage}/{check}: {type(err).__name__}: {err}")
         self.stage, self.check, self.err = stage, check, err
+        self.app_version, self.verification_id = app_version, verification_id
 
 
 def _transient_retry(fn, *, attempts: int = 3, stage: str = "", check: str = ""):
@@ -94,10 +98,15 @@ def run_verification(
         stage="RESOLVED", check="resolve_version",
     )
     image_ref = appspec.render_image_ref(spec, resolved.app_version)
-    image = _transient_retry(
-        lambda: resolver.resolve_digest(image_ref, cfg.registry_mirror),
-        stage="RESOLVED", check="resolve_digest",
-    )
+    try:
+        image = _transient_retry(
+            lambda: resolver.resolve_digest(image_ref, cfg.registry_mirror),
+            stage="RESOLVED", check="resolve_digest",
+        )
+    except StageError as exc:
+        exc.app_version = resolved.app_version
+        exc.verification_id = f"pre-verification-{app}-{sanitize_for_id(resolved.app_version)}"
+        raise
     vid = mf.verification_id(app, resolved.app_version)
     log(f"RESOLVED {app}@{resolved.app_version} image={image.image_ref} digest={image.digest[:19]}…")
 
@@ -108,6 +117,10 @@ def run_verification(
     shots_dir = workdir / "screenshots"
     try:
         _verify(spec, root, env, image, shots_dir, resolved, outcome, cfg, skip_tests)
+    except StageError as exc:
+        exc.app_version = resolved.app_version
+        exc.verification_id = vid
+        raise
     finally:
         outcome.finished_at = utcnow()
         outcome.duration_s = round(time.time() - started, 1)
@@ -351,11 +364,14 @@ def main() -> None:
     except StageError as exc:
         cls = classify(exc.stage, exc.check, exc.err)
         log(f"FAILED ({cls}) {exc}")
-        # 早期失败没有 vid：幂等键必须带 app 维度，否则任何应用的任何 RESOLVED
-        # 失败都会 PATCH 到同一个历史 issue 上（state-machine §7 幂等键语义）。
+        # 只信已解析的上下文，不把 CLI --version 当作解析结果。
+        fallback_id = (sanitize_for_id(exc.app_version) if exc.app_version
+                       else f"unknown-{exc.check}")
         record_failure(FailureRecord(
-            app=args.app, app_version="unknown", verification_id=f"pre-verification-{args.app}",
+            app=args.app, app_version=exc.app_version or "unknown",
+            verification_id=exc.verification_id or f"pre-verification-{args.app}-{fallback_id}",
             classification=cls, failed_stage=exc.stage, failed_check=exc.check, detail=str(exc.err),
+            run_url=mf.workflow_run_url(os.environ.get("GITHUB_RUN_ID", "")),
         ))
         print(json.dumps({"status": "FAILED", "classification": cls, "stage": exc.stage,
                           "check": exc.check, "detail": str(exc.err)[:2000]}, ensure_ascii=False))

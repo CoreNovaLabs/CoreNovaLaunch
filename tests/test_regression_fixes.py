@@ -18,8 +18,12 @@ import importlib.util
 import json
 import os
 import pathlib
+import socket
 import time
 import urllib.request
+from types import SimpleNamespace
+from unittest.mock import Mock
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -46,6 +50,18 @@ def _load_script(relpath: str, name: str):
 
 cv = _load_script("scripts/monitor/check_versions.py", "check_versions_under_test")
 af = _load_script("scripts/ai-test/analyze_failure.py", "analyze_failure_under_test")
+
+
+@pytest.fixture(autouse=True)
+def offline(monkeypatch):
+    from corenova import failure
+
+    def no_network(*args, **kwargs):
+        pytest.fail("回归测试禁止真实网络请求")
+
+    monkeypatch.setattr(socket.socket, "connect", no_network)
+    monkeypatch.setattr(socket, "create_connection", no_network)
+    monkeypatch.setattr(failure, "_headers", lambda: {})
 
 
 @pytest.fixture
@@ -365,6 +381,19 @@ class TestResolveFailures:
         failure.resolve_failures("ghost", "v6.61.0", "ghost-v6.61.0-20260901-003")
         assert calls == []
 
+    def test_pre_verification_closes_only_known_matching_version(self, ledger, monkeypatch):
+        failure, calls = ledger
+        self._items(failure, monkeypatch, [
+            _ledger_body("v6.61.0", "pre-verification-ghost-v6.61.0"),
+            _ledger_body("unknown", "pre-verification-ghost-unknown-resolve_version"),
+            _ledger_body("v6.62.0", "pre-verification-ghost-v6.62.0"),
+        ])
+        failure.resolve_failures("ghost", "v6.61.0", "ghost-v6.61.0-success")
+        patches = [(url, data) for method, url, data in calls if method == "PATCH"]
+        assert patches == [(
+            "https://api.github.com/repos/CoreNovaLabs/CoreNovaLaunch/issues/1", {"state": "closed"},
+        )]
+
     def test_no_repo_env_is_noop(self, ledger, monkeypatch):
         failure, calls = ledger
         monkeypatch.delenv("GITHUB_REPOSITORY")
@@ -377,6 +406,178 @@ class TestResolveFailures:
         assert meta_from_body("```corenova-failure\n{not json}\n```") == {}
         assert meta_from_body("没有块的正文") == {}
         assert meta_from_body(_ledger_body("v1", "vid-1"))["app_version"] == "v1"
+
+
+class TestStageErrorContext:
+    @pytest.fixture
+    def rig(self, monkeypatch, tmp_path):
+        from corenova import pipeline
+
+        cfg = SimpleNamespace(root=tmp_path, output_dir=tmp_path, region="test-region", registry_mirror="")
+        spec = AppSpec(name="ghost", path=tmp_path / "ghost.yaml", raw="", data={})
+        monkeypatch.setattr(pipeline.Config, "load", lambda: cfg)
+        monkeypatch.setattr(pipeline.appspec, "load", lambda *args: spec)
+        monkeypatch.setattr(pipeline.appspec, "validate", lambda *args: [])
+        monkeypatch.setattr(pipeline, "make_backend", Mock(return_value=object()))
+        monkeypatch.setattr(pipeline.platformref, "check", Mock(return_value=SimpleNamespace(
+            valid=True, reasons=[], contract={},
+        )))
+        release = Mock(return_value=SimpleNamespace(app_version="v6.61.0"))
+        digest = Mock(side_effect=ValueError("digest unavailable"))
+        monkeypatch.setattr(pipeline.resolver, "pick_release", release)
+        monkeypatch.setattr(pipeline.appspec, "render_image_ref", lambda spec, version: f"ghost:{version}")
+        monkeypatch.setattr(pipeline.resolver, "resolve_digest", digest)
+        env = object()
+        monkeypatch.setattr(pipeline.runtime, "build_env", Mock(return_value=env))
+        down = Mock()
+        monkeypatch.setattr(pipeline.runtime, "down", down)
+        records = []
+        monkeypatch.setattr(pipeline, "record_failure", records.append)
+        monkeypatch.setenv("GITHUB_REPOSITORY", "example/verify")
+        monkeypatch.setenv("GITHUB_RUN_ID", "12345")
+        monkeypatch.delenv("CORENOVA_KEEP_RUNNING", raising=False)
+        monkeypatch.setattr(pipeline.sys, "argv", ["verify", "--app", "ghost", "--version", "unresolved-input"])
+        return SimpleNamespace(
+            pipeline=pipeline, release=release, digest=digest, records=records,
+            down=down, env=env, spec=spec, cfg=cfg,
+        )
+
+    def test_digest_error_carries_actual_resolved_version(self, rig):
+        with pytest.raises(rig.pipeline.StageError) as caught:
+            rig.pipeline.run_verification("ghost", version="unresolved-input")
+        exc = caught.value
+        assert (exc.stage, exc.check) == ("RESOLVED", "resolve_digest")
+        assert exc.app_version == "v6.61.0"
+        assert exc.verification_id == "pre-verification-ghost-v6.61.0"
+        assert exc.err is rig.digest.side_effect
+        assert exc.__cause__ is exc.err
+        rig.release.assert_called_once_with(rig.spec, wanted="unresolved-input")
+        rig.digest.assert_called_once_with("ghost:v6.61.0", "")
+        rig.down.assert_not_called()
+
+    def test_main_digest_records_version_link_and_isolated_stable_ids(self, rig):
+        for version in ("V6.61.0+Build", "v6.62.0", "V6.61.0+Build"):
+            rig.release.return_value = SimpleNamespace(app_version=version)
+            with pytest.raises(SystemExit) as caught:
+                rig.pipeline.main()
+            assert caught.value.code == 2
+            rec = rig.records[-1]
+            assert rec.app_version == version
+            assert rec.verification_id == f"pre-verification-ghost-{sanitize_for_id(version)}"
+            assert rec.run_url == "https://github.com/example/verify/actions/runs/12345"
+            assert rec.failed_check == "resolve_digest"
+        assert rig.records[0].verification_id != rig.records[1].verification_id
+        assert rig.records[0].verification_id == rig.records[2].verification_id
+
+    def test_resolution_failure_stays_unknown_despite_cli_version(self, rig):
+        rig.release.side_effect = ValueError("release not found")
+        with pytest.raises(SystemExit) as caught:
+            rig.pipeline.main()
+        assert caught.value.code == 2
+        rec, = rig.records
+        assert rec.app_version == "unknown"
+        assert rec.verification_id == "pre-verification-ghost-unknown-resolve_version"
+        assert rec.run_url == "https://github.com/example/verify/actions/runs/12345"
+        rig.digest.assert_not_called()
+
+    def test_unknown_context_defaults_and_check_isolation(self, rig, monkeypatch):
+        for check in ("app_schema", "resolve_version"):
+            exc = rig.pipeline.StageError("RESOLVED", check, ValueError("invalid"))
+            assert exc.app_version == exc.verification_id == ""
+            monkeypatch.setattr(rig.pipeline, "run_verification", Mock(side_effect=exc))
+            with pytest.raises(SystemExit):
+                rig.pipeline.main()
+        assert {rec.app_version for rec in rig.records} == {"unknown"}
+        assert len({rec.verification_id for rec in rig.records}) == 2
+        assert all("ghost" in rec.verification_id for rec in rig.records)
+
+    @pytest.mark.parametrize("failure_at", ["docker", "up"])
+    def test_verifying_error_keeps_assigned_context_and_cleanup(self, rig, monkeypatch, failure_at):
+        rig.digest.side_effect = None
+        rig.digest.return_value = SimpleNamespace(image_ref="ghost:v6.61.0", pull_ref="ghost@sha256:abc", digest="sha256:abc")
+        vid = "ghost-v6.61.0-assigned"
+        monkeypatch.setattr(rig.pipeline.mf, "verification_id", lambda *args: vid)
+        monkeypatch.setattr(rig.pipeline, "docker_available", lambda: failure_at != "docker")
+        monkeypatch.setattr(rig.pipeline.runtime, "up", Mock(side_effect=ValueError("compose failed")))
+        with pytest.raises(rig.pipeline.StageError) as caught:
+            rig.pipeline.run_verification("ghost")
+        exc = caught.value
+        assert (exc.stage, exc.check) == ("VERIFYING", "compose_started")
+        assert (exc.app_version, exc.verification_id) == ("v6.61.0", vid)
+        rig.down.assert_called_once_with(rig.env, rig.spec, rig.cfg.root)
+
+        rig.down.reset_mock()
+        with pytest.raises(SystemExit) as caught:
+            rig.pipeline.main()
+        assert caught.value.code == 2
+        rec, = rig.records
+        assert (rec.app_version, rec.verification_id) == ("v6.61.0", vid)
+        assert rec.run_url == "https://github.com/example/verify/actions/runs/12345"
+        rig.down.assert_called_once_with(rig.env, rig.spec, rig.cfg.root)
+
+
+class TestFailureIssueIdentity:
+    @pytest.fixture
+    def ledger(self, monkeypatch):
+        from corenova import failure
+
+        monkeypatch.setenv("GITHUB_REPOSITORY", "example/verify")
+        record = failure.FailureRecord(
+            app="ghost", app_version="v1", verification_id="pre-verification-ghost-v1",
+            classification="MANUAL_REQUIRED", failed_stage="RESOLVED", failed_check="resolve_digest",
+        )
+        return failure, record
+
+    @pytest.mark.parametrize("state", [None, "open"])
+    def test_find_issue_matches_full_structured_id_only(self, ledger, monkeypatch, state):
+        failure, record = ledger
+        exact = {"number": 4, "body": record.body()}
+        if state is not None:
+            exact["state"] = state
+        items = [
+            {"number": 1, "body": _ledger_body("v10", record.verification_id + "0")},
+            {"number": 2, "body": _ledger_body("v2", "other-id") + record.verification_id},
+            {"number": 3, "body": record.verification_id},
+            exact,
+        ]
+        search = Mock(return_value={"items": items})
+        monkeypatch.setattr(failure, "http_json", search)
+        assert failure.find_issue(record) is exact
+        query = parse_qs(urlparse(search.call_args.args[0]).query)["q"][0].split()
+        assert "is:open" in query
+        assert "in:body" in query
+
+    def test_find_issue_ignores_closed_even_if_search_returns_it(self, ledger, monkeypatch):
+        failure, record = ledger
+        closed = {"number": 1, "body": record.body(), "state": "closed"}
+        opened = {"number": 2, "body": record.body(), "state": "open"}
+        search = Mock(return_value={"items": [closed, opened]})
+        monkeypatch.setattr(failure, "http_json", search)
+        assert failure.find_issue(record) is opened
+        search.return_value = {"items": [closed]}
+        assert failure.find_issue(record) is None
+
+    def test_update_synchronizes_title_and_increments_original_attempts(self, ledger, monkeypatch):
+        failure, record = ledger
+        previous = failure.FailureRecord(
+            app="ghost", app_version="unknown", verification_id=record.verification_id,
+            classification="TRANSIENT", failed_stage="RESOLVED", failed_check="resolve_digest", attempts=2,
+        )
+        monkeypatch.setattr(failure, "http_json", Mock(return_value={"items": [
+            {"number": 7, "body": previous.body(), "state": "open", "title": previous.title()},
+        ]}))
+        request = Mock()
+        monkeypatch.setattr(failure, "http_request", request)
+        failure.record_failure(record)
+        request.assert_called_once()
+        assert request.call_args.args[0].endswith("/issues/7")
+        assert request.call_args.kwargs["method"] == "PATCH"
+        data = request.call_args.kwargs["data"]
+        assert data["title"] == record.title() != previous.title()
+        meta = failure.meta_from_body(data["body"])
+        assert meta["attempts"] == 3
+        assert meta["app_version"] == "v1"
+        assert "needs-human" in data["labels"]
 
 
 class TestLogGoesToStderr:

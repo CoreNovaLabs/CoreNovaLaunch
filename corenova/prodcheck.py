@@ -455,22 +455,47 @@ def _check_health_external(ctx: CheckCtx) -> CheckResult:
 
 
 def _check_data_dir_write(ctx: CheckCtx) -> CheckResult:
-    """以镜像自身用户实测数据目录可写：init 的 chown 是否把 bind mount 交给了
-    正确 uid，只有 docker exec -u <image user> 能证明（root 写永远成功，测不出权限）。"""
-    image = shlex.quote(ctx.image_ref)
-    container = shlex.quote(ctx.container)
-    marker = f"{ctx.data_path.rstrip('/')}/.corenova-probe"
-    inner = shlex.quote(f"touch {shlex.quote(marker)} && rm -f {shlex.quote(marker)}")
-    inv = ctx.run_script(
-        "set -e\n"
-        f"uid_gid=$(docker image inspect --format '{{{{.Config.User}}}}' {image})\n"
-        # 空 / root / 0 都是 root：docker exec -u "" 会报 valid specification 错。
-        'case "$uid_gid" in ""|root|0) uid_gid=0 ;; esac\n'
-        f"docker exec -u \"$uid_gid\" {container} sh -c {inner}\n"
-        "echo write-ok"
-    )
-    ok = inv.exit_code == 0 and "write-ok" in inv.out
-    detail = ("数据目录以镜像用户写入回读成功" if ok
+    script = '''import json, os, pathlib, subprocess, sys, uuid
+container, image, destination = sys.argv[1:]
+info = json.loads(subprocess.check_output(["docker", "inspect", container]))[0]
+expected = subprocess.check_output(["docker", "image", "inspect", "--format", "{{.Id}}", image], text=True).strip()
+if info["Image"] != expected or not info["State"]["Running"]:
+    raise RuntimeError("container image or running state mismatch")
+mounts = [m for m in info["Mounts"] if m["Destination"] == destination]
+if len(mounts) != 1 or mounts[0]["Type"] != "bind" or not mounts[0]["RW"]:
+    raise RuntimeError("expected writable data bind mount")
+pid = int(info["State"]["Pid"])
+if pid <= 0:
+    raise RuntimeError("invalid container pid")
+proc = pathlib.Path(f"/proc/{pid}")
+for mapping in ("uid_map", "gid_map"):
+    if (proc / mapping).read_text().split() != ["0", "0", "4294967295"]:
+        raise RuntimeError("user namespace mapping is not supported by the write probe")
+status = dict(line.split(":", 1) for line in (proc / "status").read_text().splitlines() if ":" in line)
+uids, gids = [int(v) for v in status["Uid"].split()], [int(v) for v in status["Gid"].split()]
+if len(set(uids)) != 1 or len(set(gids)) != 1:
+    raise RuntimeError("mixed process credentials are not supported by the write probe")
+os.setgroups([int(v) for v in status["Groups"].split()])
+os.setgid(gids[0])
+os.setuid(uids[0])
+marker = pathlib.Path(mounts[0]["Source"]) / (".corenova-probe-" + uuid.uuid4().hex)
+fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+try:
+    with os.fdopen(fd, "w+b") as stream:
+        stream.write(b"corenova-write-probe")
+        stream.flush()
+        stream.seek(0)
+        if stream.read() != b"corenova-write-probe":
+            raise RuntimeError("write probe readback mismatch")
+finally:
+    marker.unlink()
+print("write-ok")
+'''
+    inv = ctx.run_script("python3 -c " + shlex.quote(script) + " " + " ".join(
+        shlex.quote(value) for value in (ctx.container, ctx.image_ref, ctx.data_path)
+    ))
+    ok = inv.exit_code == 0 and inv.out.strip() == "write-ok"
+    detail = ("可写 bind mount 以容器进程 UID/GID 写入、回读并删除成功" if ok
               else f"写入探测失败：{(inv.out or inv.error)[:300]}")
     return CheckResult("data_dir_write", ok, _redact(ctx, detail))
 
@@ -479,24 +504,33 @@ def _check_url_injection(ctx: CheckCtx) -> CheckResult:
     """Verify application URL injection matches the website's private LaunchUrl."""
     if not ctx.url_env_names:
         return CheckResult("url_injection", False, "应用未声明任何接收 URL 的环境变量，无从核对")
-    inv = ctx.run_script(f"docker exec {shlex.quote(ctx.container)} env")
-    if inv.exit_code != 0:
-        return CheckResult("url_injection", False, _redact(ctx, f"docker exec env 失败：{inv.out[:200]} {inv.error[:200]}"))
-    actual: dict[str, str] = {}
-    for line in inv.out.splitlines():
-        key, _, value = line.partition("=")
-        if key:
-            actual[key] = value
     want = ctx.plan.parameters.get("LaunchUrl", "http://localhost:8080")
-    bad: list[str] = []
-    for name in ctx.url_env_names:
-        value = actual.get(name, "")
-        # 注入的根 URL 不带斜杠；应用配置可能约定带斜杠或在其后接路径
-        # （如 PUBLIC_HOOK=${CORENOVA_APP_URL}/hook）。故以"根地址为前缀"实证，
-        # 尾斜杠归一，但绝不允许偏离 LaunchUrl。
-        root = value.rstrip("/")
-        if not (root == want or root.startswith(want + "/")):
-            bad.append(f"{name}={value[:120]!r}")
+    script = '''import json, subprocess, sys
+container, want, *names = sys.argv[1:]
+try:
+    values = json.loads(subprocess.check_output(["docker", "inspect", "--format", "{{json .Config.Env}}", container]))
+    env = dict(value.split("=", 1) for value in values if "=" in value)
+    result = {}
+    for name in names:
+        value = env.get(name, "").rstrip("/")
+        result[name] = value == want or value.startswith(want + "/")
+    print(json.dumps(result))
+except Exception as exc:
+    print(type(exc).__name__)
+    sys.exit(1)
+'''
+    inv = ctx.run_script("python3 -c " + shlex.quote(script) + " " + " ".join(
+        shlex.quote(value) for value in (ctx.container, want, *ctx.url_env_names)
+    ))
+    if inv.exit_code != 0:
+        return CheckResult("url_injection", False, "Docker URL 元数据核对失败（不输出环境值）")
+    try:
+        actual = json.loads(inv.out)
+    except ValueError:
+        actual = None
+    if not isinstance(actual, dict):
+        return CheckResult("url_injection", False, "URL 核对未返回有效结果")
+    bad = [f"{name}=不符或缺失" for name in ctx.url_env_names if actual.get(name) is not True]
     ok = not bad
     detail = "全部 URL 变量与私有 LaunchUrl 一致：" + ",".join(ctx.url_env_names) if ok \
         else "不符：" + "; ".join(bad)
