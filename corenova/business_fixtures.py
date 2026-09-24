@@ -198,7 +198,7 @@ def _local_main():
     from corenova.pipeline import _run_pytest
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("app", choices=["ghost", "uptime-kuma", "n8n"])
+    parser.add_argument("app", choices=["ghost", "uptime-kuma", "n8n", "vikunja"])
     parser.add_argument("--image", required=True, help="Locally cached exact tag@digest")
     parser.add_argument("--check-seeded-order", action="store_true",
                         help="Run all tests again in reverse order against the seeded instance")

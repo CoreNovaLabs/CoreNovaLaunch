@@ -9,6 +9,8 @@ import os
 
 import pytest
 
+from corenova.business_fixtures import docker_app  # noqa: F401
+
 BASE_URL = os.environ.get("CORENOVA_APP_URL", "http://localhost:3456")
 
 

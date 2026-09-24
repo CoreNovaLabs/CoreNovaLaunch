@@ -2,8 +2,7 @@
 # 契约：contracts/app-schema.md
 #
 # 版本可观测性：/api/v1/info 免鉴权返回 {"version":"v2.6.0",...}（实测 2.6.0）。
-# 实测坑：镜像以 uid=1000 运行，/db（SQLite）与 /app/vikunja/files（附件）都
-# 需要可写卷，compose 双挂载 ${CORENOVA_DATA_DIR}；不设 PUBLICURL 直接退出。
+# FILES_BASEPATH 将附件归入 SQLite 共用的 /db 卷，避免重建容器丢失附件。
 
 app:
   name: "vikunja"

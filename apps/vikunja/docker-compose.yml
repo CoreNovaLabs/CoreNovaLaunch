@@ -6,9 +6,7 @@
 #   - 应用自引用 URL 只用 ${CORENOVA_APP_URL}（经 VIKUNJA_SERVICE_PUBLICURL 注入）
 #   - 数据挂载到本次验证独占的临时目录 ${CORENOVA_DATA_DIR}，跑完即弃
 #
-# 实测：vikunja/vikunja:2.6.0 以 uid=1000 运行，SQLite 落 /db/vikunja.db、
-# 附件落 /app/vikunja/files，两处都需要可写卷 → 双挂载同一数据目录。
-# 不设 VIKUNJA_SERVICE_PUBLICURL 时进程直接退出（cors.enable 校验）。
+# FILES_BASEPATH 将附件归入 SQLite 共用的 /db 卷，避免重建容器丢失附件。
 services:
   vikunja:
     image: ${CORENOVA_APP_IMAGE}
